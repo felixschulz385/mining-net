@@ -74,7 +74,7 @@ def main():
         '--workers',
         type=str,
         nargs='+',
-        choices=['export', 'status', 'download', 'reproject', 'transfer', 'all'],
+        choices=['export', 'status', 'download', 'reproject', 'all'],
         default=['all'],
         help='Workers to run (default: all)'
     )
@@ -154,7 +154,7 @@ def main():
         countries = args.countries if hasattr(args, 'countries') else None
         
         if 'all' in workers_to_run:
-            workers_to_run = ['export', 'status', 'download', 'reproject', 'transfer']
+            workers_to_run = ['export', 'status', 'download', 'reproject']
         
         if countries:
             logger.info(f"Filtering tasks for countries: {', '.join(countries)}")
@@ -185,13 +185,6 @@ def main():
         if 'reproject' in workers_to_run:
             logger.info("Starting reprojection worker")
             worker = ReprojectionWorker(db, config, countries=countries)
-            thread = threading.Thread(target=worker.run, args=(continuous,))
-            thread.start()
-            threads.append(thread)
-        
-        if 'transfer' in workers_to_run:
-            logger.info("Starting transfer worker")
-            worker = TransferWorker(db, config, countries=countries)
             thread = threading.Thread(target=worker.run, args=(continuous,))
             thread.start()
             threads.append(thread)

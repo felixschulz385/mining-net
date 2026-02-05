@@ -4,6 +4,7 @@ import time
 import logging
 from typing import Optional, List, Tuple
 from pathlib import Path
+import warnings
 
 import zarr
 from zarr.codecs import BloscCodec
@@ -11,13 +12,20 @@ import numpy as np
 import dask.array as da
 import xarray as xr
 import rioxarray as rxr
-from odc.geo.geobox import GeoBox, GeoboxTiles
+from odc.geo.geobox import GeoBox, GeoboxTiles, geobox_union_conservative
 from odc.geo.geom import Geometry
 from odc.geo.xr import rasterize
 from shapely.geometry import shape
+import rasterio.env
 
 from .database import DownloadDatabase
 from .config import Config
+
+# Silence GDAL warnings about unsupported warp options
+warnings.filterwarnings('ignore', message='.*CPLE_NotSupported.*warp options.*')
+
+# Suppress rasterio._env logger warnings about DTYPE
+logging.getLogger('rasterio._env').setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
@@ -199,50 +207,74 @@ class ReprojectionWorker:
             # Get mining footprint from database (will rasterize per tile)
             mining_footprint_json = self.db.get_mining_footprint(geometry_hash, year)
             
-            # Reproject each tile and write to global zarr using xarray region writing
-            for tile in tiles:
-                tile_ix = tile['tile_ix']
-                tile_iy = tile['tile_iy']
-                
-                # Get tile geobox
-                tile_geobox = self.world_geobox_tiles[tile_ix, tile_iy]
-                
-                # Reproject image to this tile
-                reprojected = image.odc.reproject(tile_geobox)
-                
-                # Round resolution of coords
-                reprojected.coords["latitude"] = reprojected.coords["latitude"].values.round(5)
-                reprojected.coords["longitude"] = reprojected.coords["longitude"].values.round(5)
-                
-                # Convert to xarray Dataset with band names
-                conversion_dict = {1: 'blue', 2: 'green', 3: 'red', 4: 'nir', 5: 'swir1', 6: 'swir2', 7: 'thermal'}
-                reprojected = reprojected.to_dataset(dim="band").rename(conversion_dict)
-                
-                # Rasterize mining footprint for this tile if available
-                if mining_footprint_json is not None:
-                    mining_geom = shape(mining_footprint_json)
-                    tile_mining_footprint = rasterize(
-                        Geometry(mining_geom, crs=4326),
-                        tile_geobox
-                    )
-                    # Round coordinates for alignment
-                    tile_mining_footprint.coords['latitude'] = tile_mining_footprint.coords['latitude'].values.round(5)
-                    tile_mining_footprint.coords['longitude'] = tile_mining_footprint.coords['longitude'].values.round(5)
-                    reprojected['mining_footprint'] = tile_mining_footprint
-                
-                # Write to global zarr using coordinate-based region indexing
-                # xarray will handle the alignment automatically
-                reprojected.drop_vars(['spatial_ref'], errors='ignore')\
-                    .to_zarr(
-                    str(self.global_zarr_path),
-                    region="auto",
-                    mode='r+'
-                )
-                
-                # Mark tile as written
-                self.db.mark_tile_written(tile_ix, tile_iy, geometry_hash, year)
+            logger.info(f"Starting reprojection: {len(tiles)} tiles from {filepath.name}")
             
-            logger.info(f"✓ Reprojected {len(tiles)} tiles to global zarr")
+            # Compute union geobox of all tiles
+            tile_geoboxes = [self.world_geobox_tiles[tile['tile_ix'], tile['tile_iy']] for tile in tiles]
+            union_geobox = geobox_union_conservative(tile_geoboxes)
+            
+            logger.info(f"Union geobox: {union_geobox.shape} covering {len(tiles)} tiles")
+            
+            # Reproject image to union geobox once
+            reprojected = image.odc.reproject(union_geobox)
+            logger.debug(f"Reprojected to union geobox")
+            
+            # Round resolution of coords
+            reprojected.coords["latitude"] = reprojected.coords["latitude"].values.round(5)
+            reprojected.coords["longitude"] = reprojected.coords["longitude"].values.round(5)
+            
+            # Convert to xarray Dataset with band names
+            conversion_dict = {1: 'blue', 2: 'green', 3: 'red', 4: 'nir', 5: 'swir1', 6: 'swir2', 7: 'thermal'}
+            reprojected = reprojected.to_dataset(dim="band").rename(conversion_dict)
+            
+            # Rasterize mining footprint for union geobox if available
+            if mining_footprint_json is not None:
+                mining_geom = shape(mining_footprint_json)
+                union_mining_footprint = rasterize(
+                    Geometry(mining_geom, crs=4326),
+                    union_geobox
+                )
+                # Round coordinates for alignment
+                union_mining_footprint.coords['latitude'] = union_mining_footprint.coords['latitude'].values.round(5)
+                union_mining_footprint.coords['longitude'] = union_mining_footprint.coords['longitude'].values.round(5)
+                reprojected['mining_footprint'] = union_mining_footprint
+            
+            # Write entire union to global zarr with retry logic for Windows file locking
+            max_write_retries = 5
+            write_success = False
+            
+            for write_attempt in range(max_write_retries):
+                try:
+                    # Write to global zarr using coordinate-based region indexing
+                    # xarray will handle the alignment automatically
+                    reprojected.drop_vars(['spatial_ref'], errors='ignore')\
+                        .to_zarr(
+                        str(self.global_zarr_path),
+                        region="auto",
+                        mode='r+',
+                        consolidated=False
+                    )
+                    write_success = True
+                    logger.info(f"✓ Wrote union covering {len(tiles)} tiles to global zarr")
+                    break
+                except PermissionError as e:
+                    if write_attempt < max_write_retries - 1:
+                        wait_time = 2 ** write_attempt  # Exponential backoff
+                        logger.warning(f"PermissionError writing union, retry {write_attempt + 1}/{max_write_retries} in {wait_time}s: {e}")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"Failed to write after {max_write_retries} attempts")
+                        raise
+            
+            if write_success:
+                # Mark all tiles as written
+                for tile in tiles:
+                    self.db.mark_tile_written(tile['tile_ix'], tile['tile_iy'], geometry_hash, year)
+            
+            logger.info(f"✓ Reprojected and wrote {len(tiles)} tiles to global zarr")
+            
+            # Close the image file handle before deleting
+            image.close()
             
             # Delete local file after reprojection
             try:
