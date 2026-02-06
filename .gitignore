@@ -139,3 +139,7 @@ logs/
 
 # Models
 /models
+
+# Device-specific configuration (not committed to git)
+src/local_settings.py
+*.local.py
