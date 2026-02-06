@@ -1,15 +1,14 @@
-"""Reprojection worker to convert downloaded GeoTIFFs to zarr format."""
+"""Reprojection worker to convert downloaded GeoTIFFs to memory-mapped PyTorch format."""
 
 import time
 import logging
 from typing import Optional, List, Tuple
 from pathlib import Path
 import warnings
+import json
 
-import zarr
-from zarr.codecs import BloscCodec
 import numpy as np
-import dask.array as da
+import torch
 import xarray as xr
 import rioxarray as rxr
 from odc.geo.geobox import GeoBox, GeoboxTiles, geobox_union_conservative
@@ -30,105 +29,8 @@ logging.getLogger('rasterio._env').setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 
-def create_global_zarr_dataset(
-    output_path: str,
-    world_geobox: GeoBox,
-    bands: List[str] = None,
-    chunk_size: Tuple[int, int] = (512, 512),
-    dtype: str = 'float32'
-) -> None:
-    """Create an empty global zarr dataset for Landsat bands and mining footprints.
-    
-    Args:
-        output_path: Path to output zarr directory
-        world_geobox: Global GeoBox defining spatial structure
-        bands: List of band names (default: Landsat bands)
-        chunk_size: Chunk size for zarr storage (y, x)
-        dtype: Data type for bands
-    
-    Raises:
-        ValueError: If inputs are invalid
-    """
-    # Validate inputs
-    if chunk_size[0] <= 0 or chunk_size[1] <= 0:
-        raise ValueError(f"Invalid chunk size: {chunk_size}")
-    if dtype not in ['float32', 'float64', 'int16', 'uint16']:
-        raise ValueError(f"Invalid dtype: {dtype}. Must be one of: float32, float64, int16, uint16")
-    
-    if bands is None:
-        bands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
-    
-    if not bands:
-        raise ValueError("At least one band must be specified")
-    
-    logger.info(f"Creating global zarr dataset at {output_path}")
-    logger.info(f"  Resolution: {world_geobox.resolution}")
-    logger.info(f"  Shape: {world_geobox.shape}")
-    logger.info(f"  Bounds: {world_geobox.boundingbox}")
-    logger.info(f"  Bands: {bands}")
-    logger.info(f"  Chunk size: {chunk_size}")
-    
-    # Define spatial dimensions
-    height, width = world_geobox.shape
-    
-    # Create coordinate arrays
-    y_coords = world_geobox.coords["latitude"].values.round(5)
-    x_coords = world_geobox.coords["longitude"].values.round(5)
-    
-    # Create empty dataset with all bands
-    data_vars = {}
-    
-    # Add Landsat bands
-    for band in bands:
-        data_vars[band] = (
-            ['latitude', 'longitude'],
-            da.full((height, width), np.nan, dtype=dtype, chunks=chunk_size),
-            {
-                'long_name': f'Landsat {band} band',
-                'units': 'reflectance' if band != 'thermal' else 'kelvin'
-            }
-        )
-    
-    # Add mining footprint
-    data_vars['mining_footprint'] = (
-        ['latitude', 'longitude'],
-        da.zeros((height, width), dtype='uint8', chunks=chunk_size),
-        {
-            'long_name': 'Mining area footprint',
-            'description': 'Binary mask: 1 = mining area, 0 = no mining',
-            'units': 'boolean'
-        }
-    )
-    
-    # Create xarray Dataset
-    ds = xr.Dataset(
-        data_vars=data_vars,
-        coords={
-            'latitude': ('latitude', y_coords, {'units': 'degrees_north'}),
-            'longitude': ('longitude', x_coords, {'units': 'degrees_east'})
-        },
-        attrs={
-            'crs': str(world_geobox.crs),
-        }
-    )
-    
-    # Write to zarr with chunking and compression, but don't compute data
-    encoding = {}
-    for var in ds.data_vars:
-        encoding[var] = {
-            'chunks': chunk_size,
-            'compressor': BloscCodec()
-        }
-    
-    ds.to_zarr(output_path, mode='w', encoding=encoding, consolidated=False, compute=False)
-    
-    logger.info(f"Global zarr dataset structure created successfully")
-    logger.info(f"  Total size: {height} x {width} = {height * width:,} pixels")
-    logger.info(f"  Estimated storage (compressed): ~{(height * width * len(bands) * 4 / 10) / 1e9:.2f} GB")
-
-
 class ReprojectionWorker:
-    """Worker to reproject downloaded files to zarr."""
+    """Worker to reproject downloaded files to memory-mapped format."""
     
     def __init__(self, db: DownloadDatabase, config: Optional[Config] = None, countries: Optional[List[str]] = None, mining_file: Optional[str] = None):
         """Initialize reprojection worker.
@@ -155,26 +57,19 @@ class ReprojectionWorker:
             self.config.WORLD_GEOBOX_TILE_SIZE
         )
         
-        # Setup global zarr
-        self.global_zarr_path = self.config.DATA_DIR / "global_landsat.zarr"
-        self._ensure_global_zarr()
+        # Setup MMAP output directory
+        self.mmap_path = self.config.DATA_DIR / "landsat_mmap"
+        self.mmap_path.mkdir(exist_ok=True, parents=True)
         
-        logger.info("Initialized reprojection worker")
+        # Bands to process
+        self.bands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
+        
+        logger.info(f"Initialized reprojection worker with MMAP output: {self.mmap_path}")
     
-    def _ensure_global_zarr(self):
-        """Ensure global zarr dataset exists, create if needed."""
-        if not self.global_zarr_path.exists():
-            logger.info("Creating global zarr dataset...")
-            create_global_zarr_dataset(
-                str(self.global_zarr_path),
-                self.world_geobox,
-                chunk_size=(512, 512)
-            )
-        else:
-            logger.info(f"Using existing global zarr: {self.global_zarr_path}")
-    
-    def reproject_to_zarr(self, task_data: dict) -> bool:
-        """Reproject downloaded file to grid and save as zarr.
+    def reproject_to_mmap(self, task_data: dict) -> bool:
+        """Reproject downloaded file to grid and save as memory-mapped PyTorch tensors.
+        
+        Reprojects entire cluster once, then extracts and stores individual tiles for efficiency.
         
         Args:
             task_data: Task data from database
@@ -201,16 +96,28 @@ class ReprojectionWorker:
                 return False
             
             # Load the image
-            logger.info(f"Reprojecting {len(tiles)} tiles to global zarr for {country_code} {year}")
+            logger.info(f"Processing {len(tiles)} tiles to MMAP format for {country_code} {year}")
             image = rxr.open_rasterio(filepath)
             
-            # Get mining footprint from database (will rasterize per tile)
+            # Get mining footprint from database
             mining_footprint_json = self.db.get_mining_footprint(geometry_hash, year)
+            mining_geom = shape(mining_footprint_json) if mining_footprint_json else None
             
             logger.info(f"Starting reprojection: {len(tiles)} tiles from {filepath.name}")
             
+            # Reconstruct world geobox
+            world_geobox = GeoBox.from_bbox(
+                [-180, -90, 180, 90],
+                resolution=self.config.WORLD_GEOBOX_RESOLUTION,
+                crs=4326
+            )
+            world_geobox_tiles = GeoboxTiles(
+                world_geobox,
+                tile_shape=self.config.WORLD_GEOBOX_TILE_SIZE
+            )
+            
             # Compute union geobox of all tiles
-            tile_geoboxes = [self.world_geobox_tiles[tile['tile_ix'], tile['tile_iy']] for tile in tiles]
+            tile_geoboxes = [world_geobox_tiles[tile['tile_ix'], tile['tile_iy']] for tile in tiles]
             union_geobox = geobox_union_conservative(tile_geoboxes)
             
             logger.info(f"Union geobox: {union_geobox.shape} covering {len(tiles)} tiles")
@@ -219,7 +126,7 @@ class ReprojectionWorker:
             reprojected = image.odc.reproject(union_geobox)
             logger.debug(f"Reprojected to union geobox")
             
-            # Round resolution of coords
+            # Round coordinates for alignment
             reprojected.coords["latitude"] = reprojected.coords["latitude"].values.round(5)
             reprojected.coords["longitude"] = reprojected.coords["longitude"].values.round(5)
             
@@ -227,51 +134,80 @@ class ReprojectionWorker:
             conversion_dict = {1: 'blue', 2: 'green', 3: 'red', 4: 'nir', 5: 'swir1', 6: 'swir2', 7: 'thermal'}
             reprojected = reprojected.to_dataset(dim="band").rename(conversion_dict)
             
-            # Rasterize mining footprint for union geobox if available
-            if mining_footprint_json is not None:
-                mining_geom = shape(mining_footprint_json)
-                union_mining_footprint = rasterize(
-                    Geometry(mining_geom, crs=4326),
-                    union_geobox
-                )
-                # Round coordinates for alignment
-                union_mining_footprint.coords['latitude'] = union_mining_footprint.coords['latitude'].values.round(5)
-                union_mining_footprint.coords['longitude'] = union_mining_footprint.coords['longitude'].values.round(5)
-                reprojected['mining_footprint'] = union_mining_footprint
+            # Rasterize mining footprint for full union once
+            mining_footprint_union = None
+            if mining_geom:
+                mining_footprint_union = rasterize(Geometry(mining_geom, crs=4326), union_geobox)
             
-            # Write entire union to global zarr with retry logic for Windows file locking
-            max_write_retries = 5
-            write_success = False
+            # Extract and store individual tiles
+            for tile in tiles:
+                tile_ix = tile['tile_ix']
+                tile_iy = tile['tile_iy']
+                
+                # Get tile geobox
+                tile_geobox = world_geobox_tiles[tile_ix, tile_iy]
+                bounds = tile_geobox.boundingbox
+                
+                # Extract band data for this tile from reprojected union
+                band_arrays = [
+                    reprojected[band].sel(
+                        latitude=slice(bounds.top, bounds.bottom),
+                        longitude=slice(bounds.left, bounds.right)
+                    ).values
+                    for band in self.bands
+                ]
+                
+                # Stack bands to (H, W, C)
+                features = np.stack(band_arrays, axis=-1).astype(np.float32)
+                
+                # Extract mining footprint for this tile
+                if mining_footprint_union is not None:
+                    labels = mining_footprint_union.sel(
+                        latitude=slice(bounds.top, bounds.bottom),
+                        longitude=slice(bounds.left, bounds.right)
+                    ).values.astype(np.float32)
+                else:
+                    labels = np.zeros(tile_geobox.shape, dtype=np.float32)
+                
+                if labels.ndim == 2:
+                    labels = labels[..., np.newaxis]
+                
+                # Replace NaN with 0
+                features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+                labels = np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # Convert to torch tensors: (H, W, C) -> (C, H, W)
+                features_tensor = torch.from_numpy(features).float().permute(2, 0, 1)
+                labels_tensor = torch.from_numpy(labels).float().permute(2, 0, 1)
+                
+                # Create tile directory: cluster_id/year/tile_ix_tile_iy/
+                tile_dir = self.mmap_path / str(cluster_id) / str(year) / f"{tile_ix}_{tile_iy}"
+                tile_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Save tensors
+                torch.save(features_tensor, tile_dir / "features.pt")
+                torch.save(labels_tensor, tile_dir / "labels.pt")
+                
+                # Save metadata
+                metadata = {
+                    "tile_ix": tile_ix,
+                    "tile_iy": tile_iy,
+                    "year": year,
+                    "cluster_id": cluster_id,
+                    "geometry_hash": geometry_hash,
+                    "features_shape": list(features_tensor.shape),
+                    "labels_shape": list(labels_tensor.shape),
+                    "bands": self.bands,
+                    "dtype": "float32"
+                }
+                
+                with open(tile_dir / "metadata.json", 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                # Mark tile as written in database with correct cluster_id
+                self.db.mark_tile_mmap_written(tile_ix, tile_iy, geometry_hash, year, cluster_id)
             
-            for write_attempt in range(max_write_retries):
-                try:
-                    # Write to global zarr using coordinate-based region indexing
-                    # xarray will handle the alignment automatically
-                    reprojected.drop_vars(['spatial_ref'], errors='ignore')\
-                        .to_zarr(
-                        str(self.global_zarr_path),
-                        region="auto",
-                        mode='r+',
-                        consolidated=False
-                    )
-                    write_success = True
-                    logger.info(f"✓ Wrote union covering {len(tiles)} tiles to global zarr")
-                    break
-                except PermissionError as e:
-                    if write_attempt < max_write_retries - 1:
-                        wait_time = 2 ** write_attempt  # Exponential backoff
-                        logger.warning(f"PermissionError writing union, retry {write_attempt + 1}/{max_write_retries} in {wait_time}s: {e}")
-                        time.sleep(wait_time)
-                    else:
-                        logger.error(f"Failed to write after {max_write_retries} attempts")
-                        raise
-            
-            if write_success:
-                # Mark all tiles as written
-                for tile in tiles:
-                    self.db.mark_tile_written(tile['tile_ix'], tile['tile_iy'], geometry_hash, year)
-            
-            logger.info(f"✓ Reprojected and wrote {len(tiles)} tiles to global zarr")
+            logger.info(f"✓ Processed and saved {len(tiles)} tiles to MMAP format")
             
             # Close the image file handle before deleting
             image.close()
@@ -320,7 +256,7 @@ class ReprojectionWorker:
             if downloaded_tasks:
                 logger.info(f"Processing {len(downloaded_tasks)} downloaded tasks")
                 for task in downloaded_tasks:
-                    self.reproject_to_zarr(task)
+                    self.reproject_to_mmap(task)
             else:
                 logger.debug("No downloaded tasks to reproject")
             

@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 class DownloadWorker:
     """Worker to download completed files from Google Drive."""
     
+    # Max attempts to find file on Drive before resetting task
+    MAX_FILE_NOT_FOUND_ATTEMPTS = 3
+    
     def __init__(self, db: DownloadDatabase, config: Optional[Config] = None, countries: Optional[List[str]] = None):
         """Initialize download worker.
         
@@ -36,6 +39,8 @@ class DownloadWorker:
         self.countries = countries
         self.worker_name = "download"
         self.drive_service = None
+        # Track how many times we've checked for each task
+        self.file_not_found_count = {}
         
         self._authenticate()
         logger.info("Initialized Google Drive API")
@@ -137,8 +142,30 @@ class DownloadWorker:
                     break
             
             if not matching_file:
-                logger.debug(f"File not yet available: {expected_filename}")
-                return False
+                # Track how many times this file wasn't found
+                task_key = (task_data['geometry_hash'], task_data['year'])
+                self.file_not_found_count[task_key] = self.file_not_found_count.get(task_key, 0) + 1
+                
+                attempts = self.file_not_found_count[task_key]
+                
+                if attempts >= self.MAX_FILE_NOT_FOUND_ATTEMPTS:
+                    logger.warning(
+                        f"File not found after {attempts} attempts: {expected_filename}. "
+                        f"Resetting task to pending for re-export."
+                    )
+                    # Reset task to pending so it can be re-exported
+                    self.db.update_task_status(
+                        task_data['geometry_hash'],
+                        task_data['year'],
+                        self.config.STATUS_PENDING,
+                        error_message=f"File not found on Drive after {attempts} attempts"
+                    )
+                    # Clear the counter
+                    del self.file_not_found_count[task_key]
+                    return False
+                else:
+                    logger.debug(f"File not yet available ({attempts}/{self.MAX_FILE_NOT_FOUND_ATTEMPTS}): {expected_filename}")
+                    return False
             
             file_id = matching_file['id']
             filename = matching_file['name']
@@ -183,6 +210,11 @@ class DownloadWorker:
                 drive_filename=filename,
                 local_filepath=str(filepath)
             )
+            
+            # Clear not-found counter on success
+            task_key = (task_data['geometry_hash'], task_data['year'])
+            if task_key in self.file_not_found_count:
+                del self.file_not_found_count[task_key]
             
             self.db.increment_worker_counter(self.worker_name, "tasks_processed")
             return True

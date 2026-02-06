@@ -19,7 +19,7 @@ class Config:
     DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive']
     
     # Local paths
-    BASE_DIR = Path("/Users/felixschulz/Library/CloudStorage/OneDrive-Personal/Dokumente/Job/UNI/Basel/Research/mining-net")
+    BASE_DIR = Path("C:\\Users\\schulz0022\\Documents\\mining-net")
     DATA_DIR = BASE_DIR / "data"
     DOWNLOAD_DIR = DATA_DIR / "downloads"
     ARCHIVE_DIR = DATA_DIR / "archives"
@@ -33,7 +33,7 @@ class Config:
     BATCH_SIZE = 10  # tasks per batch
     COMPRESSION_BATCH_SIZE = 100  # files per zip
     MAX_RETRIES = 3
-    MAX_SUBMITTED_TASKS = 100  # maximum number of tasks submitted to GEE
+    MAX_SUBMITTED_TASKS = 10  # maximum number of tasks submitted to GEE
     
     # Geometry settings
     BUFFER_SIZE = 0.05  # degrees

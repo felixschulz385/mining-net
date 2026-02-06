@@ -1,6 +1,8 @@
 """Task creation and clustering logic for mining segmentation."""
 
 import logging
+import hashlib
+import json
 import numpy as np
 import geopandas as gpd
 from pathlib import Path
@@ -14,6 +16,41 @@ from .database import DownloadDatabase
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def compute_cluster_id(
+    country_code: str,
+    mining_footprint_json: dict
+) -> int:
+    """Generate a globally unique cluster ID by hashing cluster properties.
+    
+    The cluster ID is deterministic - the same country and mining footprint
+    will always produce the same ID. This ensures consistency across runs.
+    
+    Args:
+        country_code: ISO3 country code
+        mining_footprint_json: GeoJSON of mining footprint geometry
+    
+    Returns:
+        Globally unique cluster ID as positive integer within SQLite INTEGER range
+    """
+    # Create hash input from country code and mining footprint geometry
+    hash_input = json.dumps({
+        'country': country_code,
+        'footprint': mining_footprint_json
+    }, sort_keys=True)
+    
+    # Generate SHA256 hash and convert first 8 bytes to integer
+    hash_obj = hashlib.sha256(hash_input.encode())
+    cluster_id = int(hash_obj.hexdigest()[:16], 16)  # Use first 64 bits
+    
+    # Keep within SQLite's signed INTEGER range with safety margin
+    # Use modulo 2^62 to ensure we stay well below 2^63-1 (max SQLite INTEGER)
+    # This gives us ~4.6 quintillion unique values, more than enough
+    cluster_id = cluster_id % (2**62)
+    
+    logger.debug(f"Generated unique cluster ID: {cluster_id} for {country_code} cluster")
+    return cluster_id
 
 
 def load_and_filter_mining(
@@ -163,7 +200,7 @@ def cluster_mines(
 
 
 def create_cluster_tasks(
-    cluster_id: int,
+    local_cluster_idx: int,
     cluster_mask: np.ndarray,
     mining_gdf: gpd.GeoDataFrame,
     aligned_geoboxes: list,
@@ -176,7 +213,7 @@ def create_cluster_tasks(
     """Create download tasks for a single cluster.
     
     Args:
-        cluster_id: Cluster identifier
+        local_cluster_idx: Local cluster index (0 to n_components-1) - only used for logging
         cluster_mask: Boolean mask for cluster mines
         mining_gdf: GeoDataFrame with mining polygons
         aligned_geoboxes: List of aligned GeoBox objects
@@ -205,6 +242,9 @@ def create_cluster_tasks(
         mining_footprint = None
     
     mining_footprint_json = mining_footprint.__geo_interface__ if mining_footprint else None
+    
+    # Generate globally unique cluster ID (deterministic based on country + geometry)
+    cluster_id = compute_cluster_id(country_code, mining_footprint_json)
     
     # Get union of all geoboxes in cluster
     cluster_geoboxes = [aligned_geoboxes[i] for i in cluster_indices]
@@ -337,12 +377,12 @@ def create_tasks(
     tasks_created = 0
     n_components = len(np.unique(labels))
     
-    for cluster_id in range(n_components):
-        cluster_mask = mining['cluster'] == cluster_id
+    for local_cluster_idx in range(n_components):
+        cluster_mask = mining['cluster'] == local_cluster_idx
         cluster_indices = np.where(cluster_mask)[0]
         
         tasks = create_cluster_tasks(
-            cluster_id,
+            local_cluster_idx,
             cluster_mask,
             mining,
             aligned_geoboxes,

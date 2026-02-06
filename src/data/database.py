@@ -21,6 +21,7 @@ class DownloadDatabase:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._create_tables()
+        self._migrate_schema()
     
     @contextmanager
     def get_connection(self):
@@ -93,9 +94,9 @@ class DownloadDatabase:
                     geometry_hash TEXT NOT NULL,
                     year INTEGER NOT NULL,
                     cluster_id INTEGER NOT NULL,
-                    zarr_written BOOLEAN DEFAULT 0,
+                    mmap_written BOOLEAN DEFAULT 0,
                     created_at TEXT NOT NULL,
-                    written_at TEXT,
+                    mmap_written_at TEXT,
                     PRIMARY KEY (tile_ix, tile_iy, geometry_hash, year),
                     FOREIGN KEY (geometry_hash, year) REFERENCES tasks(geometry_hash, year)
                 )
@@ -111,8 +112,8 @@ class DownloadDatabase:
                 ON tiles(tile_ix, tile_iy)
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tiles_written 
-                ON tiles(zarr_written)
+                CREATE INDEX IF NOT EXISTS idx_tiles_mmap_written 
+                ON tiles(mmap_written)
             """)
             
             # Worker status table
@@ -125,6 +126,31 @@ class DownloadDatabase:
                     errors INTEGER DEFAULT 0
                 )
             """)
+    
+    def _migrate_schema(self):
+        """Migrate database schema for backward compatibility.
+        
+        Adds new columns to existing databases without breaking them.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get current table info for tiles
+            cursor.execute("PRAGMA table_info(tiles)")
+            columns = {row[1] for row in cursor.fetchall()}
+            
+            # Add mmap columns if they don't exist (for migration from zarr-only schema)
+            if 'mmap_written' not in columns:
+                try:
+                    cursor.execute("ALTER TABLE tiles ADD COLUMN mmap_written BOOLEAN DEFAULT 0")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+            
+            if 'mmap_written_at' not in columns:
+                try:
+                    cursor.execute("ALTER TABLE tiles ADD COLUMN mmap_written_at TEXT")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
     
     @staticmethod
     def hash_geometry(geometry: Dict[str, Any]) -> str:
@@ -397,7 +423,7 @@ class DownloadDatabase:
                 cursor.execute("""
                     INSERT INTO tiles (
                         tile_ix, tile_iy, geometry_hash, year,
-                        cluster_id, zarr_written, created_at
+                        cluster_id, mmap_written, created_at
                     ) VALUES (?, ?, ?, ?, ?, 0, ?)
                 """, (tile_ix, tile_iy, geometry_hash, year, 
                       cluster_id, datetime.utcnow().isoformat()))
@@ -405,29 +431,31 @@ class DownloadDatabase:
                 # Tile already exists
                 pass
     
-    def mark_tile_written(
+    def mark_tile_mmap_written(
         self,
         tile_ix: int,
         tile_iy: int,
         geometry_hash: str,
-        year: int
+        year: int,
+        cluster_id: int
     ):
-        """Mark a tile as written to zarr.
+        """Mark a tile as written to memory-mapped format.
         
         Args:
             tile_ix: Tile X index
             tile_iy: Tile Y index
             geometry_hash: Geometry hash
             year: Year
+            cluster_id: Cluster ID for the tile
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE tiles 
-                SET zarr_written = 1, written_at = ?
+                SET mmap_written = 1, cluster_id = ?, mmap_written_at = ?
                 WHERE tile_ix = ? AND tile_iy = ? 
                   AND geometry_hash = ? AND year = ?
-            """, (datetime.utcnow().isoformat(), 
+            """, (cluster_id, datetime.utcnow().isoformat(),
                   tile_ix, tile_iy, geometry_hash, year))
     
     def get_tiles_for_task(

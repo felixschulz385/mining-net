@@ -74,7 +74,7 @@ def main():
         '--workers',
         type=str,
         nargs='+',
-        choices=['export', 'status', 'download', 'reproject', 'all'],
+        choices=['export', 'status', 'download', 'reproject', 'janitor', 'all'],
         default=['all'],
         help='Workers to run (default: all)'
     )
@@ -88,6 +88,11 @@ def main():
         '--once',
         action='store_true',
         help='Run once instead of continuously'
+    )
+    run_parser.add_argument(
+        '--clean',
+        action='store_true',
+        help='Enable cleanup mode for janitor (removes stale file references)'
     )
     
     # Status command
@@ -147,6 +152,7 @@ def main():
         from .download import DownloadWorker
         from .reproject import ReprojectionWorker
         from .transfer import TransferWorker
+        from .janitor import JanitorWorker
         import threading
         
         continuous = not args.once
@@ -154,7 +160,7 @@ def main():
         countries = args.countries if hasattr(args, 'countries') else None
         
         if 'all' in workers_to_run:
-            workers_to_run = ['export', 'status', 'download', 'reproject']
+            workers_to_run = ['export', 'status', 'download', 'reproject', 'janitor']
         
         if countries:
             logger.info(f"Filtering tasks for countries: {', '.join(countries)}")
@@ -185,6 +191,14 @@ def main():
         if 'reproject' in workers_to_run:
             logger.info("Starting reprojection worker")
             worker = ReprojectionWorker(db, config, countries=countries)
+            thread = threading.Thread(target=worker.run, args=(continuous,))
+            thread.start()
+            threads.append(thread)
+        
+        if 'janitor' in workers_to_run:
+            logger.info("Starting janitor worker")
+            clean_mode = args.clean if hasattr(args, 'clean') else False
+            worker = JanitorWorker(db, config, countries=countries, clean=clean_mode)
             thread = threading.Thread(target=worker.run, args=(continuous,))
             thread.start()
             threads.append(thread)
