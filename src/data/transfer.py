@@ -6,6 +6,7 @@ import subprocess
 import shutil
 import tarfile
 import hashlib
+import json
 from typing import Optional, List
 from pathlib import Path
 from datetime import datetime
@@ -40,6 +41,10 @@ class TransferWorker:
         # Create temp directory for compression
         self.temp_dir = self.config.DATA_DIR / "temp_transfer"
         self.temp_dir.mkdir(exist_ok=True)
+        
+        # Create manifests directory
+        self.manifests_dir = self.config.DATA_DIR / "manifests"
+        self.manifests_dir.mkdir(exist_ok=True)
     
     def _compute_file_hash(self, filepath: Path) -> str:
         """Compute SHA256 hash of a file.
@@ -84,6 +89,59 @@ class TransferWorker:
             
         except Exception as e:
             logger.error(f"Error compressing cluster: {e}", exc_info=True)
+            return None
+    
+    def _create_manifest(self, cluster_id: int) -> Optional[Path]:
+        """Create a manifest file for a cluster.
+        
+        Args:
+            cluster_id: Cluster ID
+            
+        Returns:
+            Path to manifest file or None on failure
+        """
+        try:
+            # Get cluster information from database
+            cluster_info = self.db.get_cluster_info(cluster_id)
+            if not cluster_info:
+                logger.error(f"No cluster info found for cluster {cluster_id}")
+                return None
+            
+            # Create manifest
+            manifest = {
+                "version": "1.0",
+                "cluster_id": cluster_id,
+                "country_code": cluster_info['country_code'],
+                "created_at": cluster_info['created_at'],
+                "latest_reprojected_at": cluster_info['latest_reprojected_at'],
+                "generated_at": datetime.utcnow().isoformat(),
+                "years": cluster_info['years'],
+                "tile_count": cluster_info['tile_count'],
+                "tiles": [
+                    {
+                        "tile_ix": tile['tile_ix'],
+                        "tile_iy": tile['tile_iy'],
+                        "year": tile['year'],
+                        "geometry_hash": tile['geometry_hash'],
+                        "mmap_written_at": tile['mmap_written_at']
+                    }
+                    for tile in cluster_info['tiles']
+                ]
+            }
+            
+            # Save manifest locally
+            manifest_filename = f"cluster_{cluster_id}_manifest.json"
+            manifest_path = self.manifests_dir / manifest_filename
+            
+            with open(manifest_path, 'w') as f:
+                json.dump(manifest, f, indent=2)
+            
+            logger.info(f"Created manifest for cluster {cluster_id}: {cluster_info['tile_count']} tiles across {len(cluster_info['years'])} years")
+            
+            return manifest_path
+            
+        except Exception as e:
+            logger.error(f"Error creating manifest: {e}", exc_info=True)
             return None
     
     def _transfer_file(self, local_path: Path, remote_path: str) -> bool:
@@ -227,6 +285,15 @@ class TransferWorker:
                 return False
             
             try:
+                # Create manifest for this cluster
+                manifest_path = self._create_manifest(cluster_id)
+                if not manifest_path:
+                    self.db.update_task_status(
+                        geometry_hash, year, self.config.STATUS_FAILED,
+                        error_message="Manifest creation failed"
+                    )
+                    return False
+                
                 # Transfer compressed archive
                 remote_archive = f"{self.config.HPC_ZARR_PATH}/{archive_path.name}"
                 if not self._transfer_file(archive_path, self.config.HPC_ZARR_PATH):
@@ -244,6 +311,12 @@ class TransferWorker:
                     )
                     return False
                 
+                # Transfer manifest to HPC
+                remote_manifests_dir = f"{self.config.HPC_ZARR_PATH}/manifests"
+                if not self._transfer_file(manifest_path, remote_manifests_dir):
+                    logger.warning(f"Failed to transfer manifest for cluster {cluster_id}")
+                    # Don't fail the whole task if manifest upload fails
+                
                 # Update database
                 self.db.update_task_status(
                     geometry_hash, year, self.config.STATUS_UPLOADED
@@ -251,11 +324,11 @@ class TransferWorker:
                 
                 self.db.increment_worker_counter(self.worker_name, "tasks_processed")
                 
-                logger.info(f"Successfully transferred cluster {cluster_id}")
+                logger.info(f"Successfully transferred cluster {cluster_id} with manifest")
                 return True
                 
             finally:
-                # Cleanup local archive
+                # Cleanup local archive (keep manifest)
                 if archive_path.exists():
                     archive_path.unlink()
                     logger.debug(f"Cleaned up local archive: {archive_path.name}")
@@ -272,90 +345,6 @@ class TransferWorker:
             self.db.increment_worker_counter(self.worker_name, "errors")
             return False
     
-    def backup_database(self) -> bool:
-        """Backup database to HPC with incremental versioning.
-        
-        Uses SCP for database backups with timestamped versions.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            db_path = Path(self.db.db_path)
-            if not db_path.exists():
-                logger.error(f"Database file not found: {db_path}")
-                return False
-            
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            backup_name = f"mining_segmentation_{timestamp}.db"
-            
-            remote_backup_dir = self.config.HPC_BACKUP_PATH
-            remote_latest = f"{remote_backup_dir}/latest"
-            remote_current = f"{remote_backup_dir}/{timestamp}"
-            
-            logger.info(f"Backing up database to HPC: {backup_name}")
-            
-            # Create backup directory structure on remote
-            mkdir_cmd = [
-                'ssh',
-                '-i', str(self.config.SSH_KEY),
-                '-o', 'StrictHostKeyChecking=no',
-                f"{self.config.HPC_USER}@{self.config.HPC_HOST}",
-                f"mkdir -p {remote_current}"
-            ]
-            result = subprocess.run(mkdir_cmd, check=True, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"Failed to create remote backup directory: {result.stderr}")
-                return False
-            
-            # Transfer database file using SCP
-            remote_target = f"{self.config.HPC_USER}@{self.config.HPC_HOST}:{remote_current}/{backup_name}"
-            scp_cmd = [
-                'scp',
-                '-i', str(self.config.SSH_KEY),
-                '-o', 'StrictHostKeyChecking=no',
-                '-C',  # Enable compression during transfer
-                str(db_path),
-                remote_target
-            ]
-            
-            result = subprocess.run(scp_cmd, check=True, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"SCP backup failed: {result.stderr}")
-                return False
-            
-            # Update 'latest' symlink
-            update_latest_cmd = [
-                'ssh',
-                '-i', str(self.config.SSH_KEY),
-                '-o', 'StrictHostKeyChecking=no',
-                f"{self.config.HPC_USER}@{self.config.HPC_HOST}",
-                f"rm -f {remote_latest} && ln -s {remote_current} {remote_latest}"
-            ]
-            subprocess.run(update_latest_cmd, check=True, capture_output=True)
-            
-            db_size = db_path.stat().st_size / 1e6
-            logger.info(f"Database backed up successfully ({db_size:.2f} MB)")
-            
-            # Cleanup old backups (keep last 30 days)
-            cleanup_cmd = [
-                'ssh',
-                '-i', str(self.config.SSH_KEY),
-                '-o', 'StrictHostKeyChecking=no',
-                f"{self.config.HPC_USER}@{self.config.HPC_HOST}",
-                f"find {remote_backup_dir} -maxdepth 1 -type d -name '20*' -mtime +30 -exec rm -rf {{}} \\;"
-            ]
-            subprocess.run(cleanup_cmd, capture_output=True)
-            
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Database backup failed: {e.stderr}")
-            return False
-        except Exception as e:
-            logger.error(f"Error backing up database: {e}", exc_info=True)
-            return False
-    
     def run(self, continuous: bool = True):
         """Run the transfer worker.
         
@@ -363,12 +352,7 @@ class TransferWorker:
             continuous: If True, run continuously; otherwise run once
         """
         logger.info(f"Starting {self.worker_name} worker")
-        
-        # Initial database backup
-        self.backup_database()
-        
-        backup_counter = 0
-        backup_interval = 100  # Backup database every 100 tasks
+        logger.info("Using manifest-based tracking (database is local-only)")
         
         while True:
             self.db.update_worker_heartbeat(self.worker_name, "running")
@@ -386,17 +370,9 @@ class TransferWorker:
             if reprojected_tasks:
                 logger.info(f"Processing {len(reprojected_tasks)} reprojected tasks")
                 for task in reprojected_tasks:
-                    if self.transfer_cluster(task):
-                        backup_counter += 1
-                        
-                        # Periodic database backup
-                        if backup_counter >= backup_interval:
-                            self.backup_database()
-                            backup_counter = 0
+                    self.transfer_cluster(task)
             else:
                 logger.debug("No reprojected tasks to transfer")
-                # Backup database when idle
-                self.backup_database()
             
             if not continuous:
                 break

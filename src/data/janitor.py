@@ -237,56 +237,17 @@ class JanitorWorker:
         logger.info(f"Found {len(clusters)} clusters with {total_entries} year entries in MMAP")
         return clusters
     
-    def _get_hpc_clusters(self) -> Dict[int, Set[int]]:
-        """Get clusters and years on HPC.
-        
-        Returns:
-            Dict mapping cluster_id -> set of years
-        """
-        clusters = defaultdict(set)
-        
-        try:
-            # List cluster directories on HPC
-            list_cmd = [
-                'ssh',
-                '-i', str(self.config.SSH_KEY),
-                '-o', 'StrictHostKeyChecking=no',
-                '-o', 'ConnectTimeout=10',
-                f"{self.config.HPC_USER}@{self.config.HPC_HOST}",
-                f"find {self.config.HPC_ZARR_PATH} -mindepth 2 -maxdepth 2 -type d"
-            ]
-            
-            result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode != 0:
-                logger.warning(f"Could not list HPC clusters: {result.stderr}")
-                return clusters
-            
-            # Parse output: paths like /path/to/cluster_id/year
-            for line in result.stdout.strip().split('\n'):
-                if not line:
-                    continue
-                try:
-                    parts = line.strip().split('/')
-                    if len(parts) >= 2:
-                        cluster_id = int(parts[-2])
-                        year = int(parts[-1])
-                        clusters[cluster_id].add(year)
-                except (ValueError, IndexError):
-                    continue
-            
-            total_entries = sum(len(years) for years in clusters.values())
-            logger.info(f"Found {len(clusters)} clusters with {total_entries} year entries on HPC")
-            return clusters
-            
-        except subprocess.TimeoutExpired:
-            logger.warning("Timeout while checking HPC clusters")
-            return clusters
-        except Exception as e:
-            logger.warning(f"Error checking HPC clusters: {e}")
-            return clusters
-    
     def _count_tiles_in_mmap(self, cluster_id: int, year: int) -> int:
+        """Count number of tile directories in MMAP for a cluster/year.
+        
+        Args:
+            cluster_id: Cluster ID
+            year: Year
+            
+        Returns:
+            Number of tile directories found
+        """
+        mmap_path = self.config.DATA_DIR / "landsat_mmap" / str(cluster_id) / str(year)
         """Count number of tile directories in MMAP for a cluster/year.
         
         Args:
@@ -346,20 +307,17 @@ class JanitorWorker:
     
     def check_database_integrity(self):
         """Check database tasks against filesystem and fix inconsistencies."""
-        logger.info("=== Checking Database Integrity ===")
-        
         issues_found = 0
         issues_fixed = 0
+        issues_by_status = {}
         
         # Get filesystem state
         drive_files = self._get_drive_files()
         downloaded_files = self._get_downloaded_files()
         mmap_clusters = self._get_mmap_clusters()
-        hpc_clusters = self._get_hpc_clusters()
         
-        # Check each status level
+        # Check each status level (skip UPLOADED - no remote checking)
         statuses_to_check = [
-            self.config.STATUS_UPLOADED,
             self.config.STATUS_REPROJECTED,
             self.config.STATUS_DOWNLOADED,
             self.config.STATUS_COMPLETED
@@ -372,7 +330,7 @@ class JanitorWorker:
             if self.countries:
                 tasks = [t for t in tasks if t['country_code'] in self.countries]
             
-            logger.info(f"Checking {len(tasks)} tasks with status '{status}'")
+            issues_by_status[status] = {'total': len(tasks), 'issues': []}
             
             for task in tasks:
                 geometry_hash = task['geometry_hash']
@@ -383,22 +341,7 @@ class JanitorWorker:
                 issue = None
                 new_status = None
                 
-                if status == self.config.STATUS_UPLOADED:
-                    # Check HPC has the cluster/year
-                    if cluster_id is None:
-                        issue = "No cluster_id"
-                        new_status = self.config.STATUS_PENDING
-                    elif cluster_id not in hpc_clusters or year not in hpc_clusters[cluster_id]:
-                        issue = "Cluster not on HPC"
-                        # Check if we can downgrade to reprojected
-                        if cluster_id in mmap_clusters and year in mmap_clusters[cluster_id]:
-                            new_status = self.config.STATUS_REPROJECTED
-                        elif task.get('local_filepath') and Path(task['local_filepath']).exists():
-                            new_status = self.config.STATUS_DOWNLOADED
-                        else:
-                            new_status = self.config.STATUS_PENDING
-                
-                elif status == self.config.STATUS_REPROJECTED:
+                if status == self.config.STATUS_REPROJECTED:
                     # Check MMAP exists and has correct tiles matching database
                     if cluster_id is None:
                         issue = "No cluster_id"
@@ -432,14 +375,6 @@ class JanitorWorker:
                                 issue += f", missing {len(missing)} tiles"
                             if extra:
                                 issue += f", {len(extra)} extra tiles"
-                            
-                            # Remove incomplete MMAP directory
-                            if self.clean:
-                                mmap_dir = self.config.DATA_DIR / "landsat_mmap" / str(cluster_id) / str(year)
-                                if mmap_dir.exists():
-                                    import shutil
-                                    shutil.rmtree(mmap_dir)
-                                    logger.info(f"  Removed incomplete MMAP: {mmap_dir}")
                             new_status = self.config.STATUS_DOWNLOADED if task.get('local_filepath') else self.config.STATUS_PENDING
                 
                 elif status == self.config.STATUS_DOWNLOADED:
@@ -463,33 +398,80 @@ class JanitorWorker:
                 
                 if issue:
                     issues_found += 1
+                    issues_by_status[status]['issues'].append({
+                        'country': country_code,
+                        'year': year,
+                        'cluster_id': cluster_id,
+                        'issue': issue,
+                        'new_status': new_status,
+                        'geometry_hash': geometry_hash
+                    })
+        
+        # Now apply fixes and generate report
+        logger.info("=== Database Integrity Check Report ===")
+        
+        # Print summary statistics first
+        logger.info(f"\nOverall Statistics:")
+        for status in statuses_to_check:
+            status_info = issues_by_status[status]
+            issues_count = len(status_info['issues'])
+            total = status_info['total']
+            pct = (issues_count / total * 100) if total > 0 else 0
+            logger.info(f"  {status}: {total - issues_count}/{total} OK ({pct:.1f}% have issues)")
+        
+        # Then detailed issues
+        for status in statuses_to_check:
+            status_info = issues_by_status[status]
+            if not status_info['issues']:
+                continue
+            logger.info(f"\n{status}: {len(status_info['issues'])} issues found")
+            
+            # Group issues by type for cleaner output
+            issues_by_type = defaultdict(list)
+            for issue_data in status_info['issues']:
+                issues_by_type[issue_data['issue']].append(issue_data)
+            
+            for issue_type, issue_list in issues_by_type.items():
+                logger.warning(f"  {issue_type}: {len(issue_list)} tasks")
+                # Show first 5 examples
+                for issue_data in issue_list[:5]:
                     logger.warning(
-                        f"  Issue: {country_code} {year} (cluster {cluster_id}): "
-                        f"{issue} - status '{status}'"
+                        f"    - {issue_data['country']} {issue_data['year']} (cluster {issue_data['cluster_id']})"
                     )
-                    
-                    if self.clean and new_status:
+                if len(issue_list) > 5:
+                    logger.warning(f"    ... and {len(issue_list) - 5} more")
+            
+            # Apply fixes for all issues of this status
+            if self.clean:
+                for issue_data in status_info['issues']:
+                    if issue_data['new_status']:
+                        # Remove incomplete MMAP if needed for REPROJECTED issues
+                        if status == self.config.STATUS_REPROJECTED and 'mismatch' in issue_data['issue'].lower():
+                            mmap_dir = self.config.DATA_DIR / "landsat_mmap" / str(issue_data['cluster_id']) / str(issue_data['year'])
+                            if mmap_dir.exists():
+                                import shutil
+                                shutil.rmtree(mmap_dir)
+                        
                         self.db.update_task_status(
-                            geometry_hash, year, new_status,
-                            error_message=f"Janitor: {issue}"
+                            issue_data['geometry_hash'], 
+                            issue_data['year'], 
+                            issue_data['new_status'],
+                            error_message=f"Janitor: {issue_data['issue']}"
                         )
-                        logger.info(f"    Fixed: Reset to '{new_status}'")
                         issues_fixed += 1
         
-        logger.info(f"Database integrity check complete: {issues_found} issues found, {issues_fixed} fixed")
+        logger.info(f"\nSummary: {issues_found} issues found, {issues_fixed} fixed")
         return issues_found, issues_fixed
     
     def check_orphaned_mmap(self):
         """Check for MMAP directories not in database."""
-        logger.info("=== Checking for Orphaned MMAP Files ===")
-        
         orphans_found = 0
         orphans_removed = 0
+        orphan_list = []
         
         mmap_path = self.config.DATA_DIR / "landsat_mmap"
         
         if not mmap_path.exists():
-            logger.info("MMAP directory does not exist")
             return 0, 0
         
         # Get all tasks with cluster IDs from database
@@ -502,8 +484,6 @@ class JanitorWorker:
             """)
             db_clusters = {(row['cluster_id'], row['year']) for row in cursor.fetchall()}
         
-        logger.info(f"Database has {len(db_clusters)} cluster/year combinations")
-        
         # Check each MMAP cluster directory
         for cluster_dir in mmap_path.iterdir():
             if not cluster_dir.is_dir():
@@ -512,7 +492,6 @@ class JanitorWorker:
             try:
                 cluster_id = int(cluster_dir.name)
             except ValueError:
-                logger.warning(f"Invalid cluster directory name: {cluster_dir.name}")
                 continue
             
             # Check year subdirectories
@@ -523,41 +502,47 @@ class JanitorWorker:
                 try:
                     year = int(year_dir.name)
                 except ValueError:
-                    logger.warning(f"Invalid year directory name: {year_dir.name}")
                     continue
                 
                 # Check if this cluster/year is in database
                 if (cluster_id, year) not in db_clusters:
                     orphans_found += 1
-                    logger.warning(f"  Orphaned MMAP: cluster {cluster_id}, year {year}")
-                    
-                    if self.clean:
-                        import shutil
-                        shutil.rmtree(year_dir)
-                        logger.info(f"    Removed: {year_dir}")
-                        orphans_removed += 1
+                    orphan_list.append((cluster_id, year, year_dir))
+        
+        # Report and clean
+        if orphan_list:
+            logger.info(f"\n=== Orphaned MMAP Files ===")
+            logger.info(f"Found {len(orphan_list)} orphaned cluster/year directories")
+            
+            for cluster_id, year, year_dir in orphan_list:
+                logger.warning(f"  Cluster {cluster_id}, year {year}")
+                
+                if self.clean:
+                    import shutil
+                    shutil.rmtree(year_dir)
+                    orphans_removed += 1
             
             # Remove empty cluster directories
-            if self.clean and cluster_dir.exists():
-                try:
-                    if not any(cluster_dir.iterdir()):
-                        cluster_dir.rmdir()
-                        logger.info(f"  Removed empty cluster directory: {cluster_dir}")
-                except (OSError, StopIteration):
-                    pass
+            if self.clean:
+                for cluster_dir in mmap_path.iterdir():
+                    if cluster_dir.is_dir():
+                        try:
+                            if not any(cluster_dir.iterdir()):
+                                cluster_dir.rmdir()
+                        except (OSError, StopIteration):
+                            pass
+            
+            logger.info(f"Removed: {orphans_removed}")
         
-        logger.info(f"Orphaned MMAP check complete: {orphans_found} found, {orphans_removed} removed")
         return orphans_found, orphans_removed
     
     def check_orphaned_downloads(self):
         """Check for downloaded files not referenced in database."""
-        logger.info("=== Checking for Orphaned Download Files ===")
-        
         orphans_found = 0
         orphans_removed = 0
+        orphan_list = []
         
         if not self.config.DOWNLOAD_DIR.exists():
-            logger.info("Download directory does not exist")
             return 0, 0
         
         # Get all local_filepath values from database
@@ -566,20 +551,26 @@ class JanitorWorker:
             cursor.execute("SELECT local_filepath FROM tasks WHERE local_filepath IS NOT NULL")
             db_files = {Path(row['local_filepath']) for row in cursor.fetchall()}
         
-        logger.info(f"Database references {len(db_files)} downloaded files")
-        
         # Check each file in download directory
         for file in self.config.DOWNLOAD_DIR.glob("*.tif"):
             if file not in db_files:
                 orphans_found += 1
-                logger.warning(f"  Orphaned download: {file.name}")
+                orphan_list.append(file)
+        
+        # Report and clean
+        if orphan_list:
+            logger.info(f"\n=== Orphaned Download Files ===")
+            logger.info(f"Found {len(orphan_list)} orphaned download files")
+            
+            for file in orphan_list:
+                logger.warning(f"  {file.name}")
                 
                 if self.clean:
                     file.unlink()
-                    logger.info(f"    Removed: {file}")
                     orphans_removed += 1
+            
+            logger.info(f"Removed: {orphans_removed}")
         
-        logger.info(f"Orphaned downloads check complete: {orphans_found} found, {orphans_removed} removed")
         return orphans_found, orphans_removed
     
     def run_checks(self) -> Dict[str, Tuple[int, int]]:

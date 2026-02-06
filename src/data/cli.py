@@ -98,13 +98,8 @@ def main():
     # Status command
     status_parser = subparsers.add_parser('status', help='Show download status')
     
-    # Backup command
-    backup_parser = subparsers.add_parser('backup', help='Backup database to HPC')
-    
-    # Removed compress-remaining command (no longer needed with zarr)
-    
     # Common arguments
-    for p in [create_parser, run_parser, status_parser, backup_parser]:
+    for p in [create_parser, run_parser, status_parser]:
         p.add_argument(
             '--db',
             type=str,
@@ -233,19 +228,6 @@ def main():
         
         if stats['year_range']['min_year']:
             print(f"\nYear range: {stats['year_range']['min_year']} - {stats['year_range']['max_year']}")
-    
-    elif args.command == 'backup':
-        from .transfer import TransferWorker
-        
-        logger.info("Starting database backup")
-        worker = TransferWorker(db, config)
-        success = worker.backup_database()
-        
-        if success:
-            print("\n✓ Database backed up successfully to HPC")
-        else:
-            print("\n✗ Database backup failed - check logs")
-            exit(1)
 
 
 if __name__ == '__main__':

@@ -480,6 +480,65 @@ class DownloadDatabase:
             """, (geometry_hash, year))
             return [dict(row) for row in cursor.fetchall()]
     
+    def get_cluster_info(self, cluster_id: int) -> Optional[Dict[str, Any]]:
+        """Get comprehensive cluster information including all tiles and metadata.
+        
+        Args:
+            cluster_id: Cluster ID
+            
+        Returns:
+            Dict with cluster metadata and tile inventory, or None if not found
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get cluster metadata from tasks
+            cursor.execute("""
+                SELECT DISTINCT 
+                    cluster_id,
+                    country_code,
+                    MIN(created_at) as created_at,
+                    MAX(reprojected_at) as latest_reprojected_at
+                FROM tasks
+                WHERE cluster_id = ?
+                GROUP BY cluster_id, country_code
+            """, (cluster_id,))
+            
+            metadata_row = cursor.fetchone()
+            if not metadata_row:
+                return None
+            
+            metadata = dict(metadata_row)
+            
+            # Get all tiles for this cluster with their years
+            cursor.execute("""
+                SELECT 
+                    tile_ix,
+                    tile_iy,
+                    year,
+                    geometry_hash,
+                    mmap_written,
+                    mmap_written_at
+                FROM tiles
+                WHERE cluster_id = ? AND mmap_written = 1
+                ORDER BY year, tile_ix, tile_iy
+            """, (cluster_id,))
+            
+            tiles = [dict(row) for row in cursor.fetchall()]
+            
+            # Get year range
+            years = sorted(set(t['year'] for t in tiles))
+            
+            return {
+                'cluster_id': metadata['cluster_id'],
+                'country_code': metadata['country_code'],
+                'created_at': metadata['created_at'],
+                'latest_reprojected_at': metadata['latest_reprojected_at'],
+                'years': years,
+                'tile_count': len(tiles),
+                'tiles': tiles
+            }
+    
     def get_all_cluster_years(self) -> List[Dict[str, Any]]:
         """Get all distinct cluster_id and year combinations from database.
         
