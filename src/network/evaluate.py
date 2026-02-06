@@ -94,6 +94,19 @@ class MiningSegmentationEvaluator:
             model.load_state_dict(checkpoint)
         
         model = model.to(self.device)
+        
+        # Optionally compile model (PyTorch 2.0+)
+        if self.network_config.USE_COMPILE:
+            try:
+                logger.info(f"Compiling model with mode='{self.network_config.COMPILE_MODE}'...")
+                model = torch.compile(
+                    model,
+                    mode=self.network_config.COMPILE_MODE
+                )
+                logger.info("Model compiled successfully")
+            except Exception as e:
+                logger.warning(f"Failed to compile model: {e}. Continuing without compilation.")
+        
         model.eval()
         
         logger.info("Model loaded successfully")

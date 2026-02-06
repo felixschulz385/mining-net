@@ -1,13 +1,41 @@
 """General configuration for mining-net project."""
 
+import os
 from pathlib import Path
+
+
+def _get_base_dir():
+    """Get base directory from environment variable or raise error.
+    
+    Device-specific paths should not be committed to git.
+    Set MINING_NET_BASE_DIR environment variable or create local_settings.py.
+    """
+    # Try environment variable first
+    env_path = os.getenv('MINING_NET_BASE_DIR')
+    if env_path:
+        return Path(env_path)
+    
+    # Try to import local settings
+    try:
+        from local_settings import BASE_DIR as local_base_dir
+        return Path(local_base_dir)
+    except ImportError:
+        pass
+    
+    # Raise informative error
+    raise RuntimeError(
+        "BASE_DIR not configured. Please set one of:\n"
+        "  1. Environment variable: MINING_NET_BASE_DIR\n"
+        "  2. Create src/local_settings.py with BASE_DIR = '/path/to/mining-net'\n"
+        "\nNote: local_settings.py is gitignored for device-specific configuration."
+    )
 
 
 class Config:
     """General configuration settings for the mining-net project."""
     
-    # Base paths
-    BASE_DIR = Path("C:\\Users\\schulz0022\\Documents\\mining-net")
+    # Base paths (device-specific, not committed to git)
+    BASE_DIR = _get_base_dir()
     DATA_DIR = BASE_DIR / "data"
     
     # Database

@@ -19,7 +19,7 @@ class Config:
     DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive']
     
     # Local paths
-    BASE_DIR = Path("C:\\Users\\schulz0022\\Documents\\mining-net")
+    BASE_DIR = Path("/scicore/home/meiera/schulz0022/projects/mining-net")
     DATA_DIR = BASE_DIR / "data"
     DOWNLOAD_DIR = DATA_DIR / "downloads"
     ARCHIVE_DIR = DATA_DIR / "archives"
