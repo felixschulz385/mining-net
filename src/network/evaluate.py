@@ -22,8 +22,8 @@ from network.utils import (
     prepare_for_training,
     visualize_predictions
 )
-from data.data_loader import MiningSegmentationDataLoader
-from data.config import Config as DataConfig
+from network.data_loader import MiningSegmentationDataLoader
+from config import Config as DataConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,14 +39,14 @@ class MiningSegmentationEvaluator:
         self,
         checkpoint_path: str,
         network_config: Optional[NetworkConfig] = None,
-        data_config: Optional[DataConfig] = None
+        data_config = None
     ):
         """Initialize evaluator.
         
         Args:
             checkpoint_path: Path to model checkpoint
             network_config: Network configuration
-            data_config: Data configuration
+            data_config: Data configuration (from config.Config)
         """
         self.network_config = network_config or NetworkConfig()
         self.data_config = data_config or DataConfig()

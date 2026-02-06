@@ -20,7 +20,13 @@ Multi-worker system for downloading Landsat annual composites for mining regions
 1. **Export Worker**: Submits batch export tasks to Google Earth Engine with geobox-aligned queries
 2. **Status Checker**: Monitors GEE task completion status
 3. **Download Worker**: Downloads completed files, reprojects to grid, saves as zarr, and deletes from Drive
-4. **Compression Worker**: Batches 100 files into zip archives (deprecated with zarr storage)
+4. **Reprojection Worker**: Converts downloaded GeoTIFFs to memory-mapped PyTorch format
+5. **Transfer Worker**: Uploads processed data to HPC cluster
+6. **Janitor Worker**: Verifies filesystem integrity and fixes inconsistencies
+   - Checks database tasks match actual files
+   - Detects and removes orphaned files
+   - Validates tile completeness
+   - Can run in CHECK (report only) or CLEAN (fix) mode
 
 ### Database Schema
 
@@ -80,6 +86,12 @@ python -m gnt.data.download.mining_segmentation run
 # Run specific workers
 python -m gnt.data.download.mining_segmentation run --workers export status download
 
+# Run janitor in check mode (reports issues only)
+python -m gnt.data.download.mining_segmentation run --workers janitor --once
+
+# Run janitor in clean mode (fixes issues)
+python -m gnt.data.download.mining_segmentation run --workers janitor --clean --once
+
 # Run once (useful for testing)
 python -m gnt.data.download.mining_segmentation run --once
 
@@ -135,9 +147,47 @@ nohup python -m gnt.data.download.mining_segmentation run &
 # 3. Monitor progress
 watch -n 60 'python -m gnt.data.download.mining_segmentation status'
 
-# 4. When complete, compress any remaining files
-python -m gnt.data.download.mining_segmentation compress-remaining
+# 4. Run janitor to check integrity
+python -m gnt.data.download.mining_segmentation run --workers janitor --once -v
+
+# 5. Fix any issues found
+python -m gnt.data.download.mining_segmentation run --workers janitor --clean --once
 ```
+
+## Janitor Worker
+
+The janitor maintains filesystem integrity and database consistency:
+
+**Check Mode** (reports issues only):
+```bash
+python -m gnt.data.download.mining_segmentation run --workers janitor --once
+```
+
+**Clean Mode** (fixes issues automatically):
+```bash
+python -m gnt.data.download.mining_segmentation run --workers janitor --clean --once
+```
+
+The janitor performs these checks:
+1. **Database Integrity**: Verifies task status matches filesystem
+   - UPLOADED tasks exist on HPC cluster
+   - REPROJECTED tasks have complete MMAP directories with exact tile matches
+   - DOWNLOADED tasks have local files
+   - COMPLETED tasks are on Google Drive
+2. **Orphan Detection**: Finds files not in database
+   - MMAP directories without database entries
+   - Downloaded files without task references
+3. **Tile Validation**: Ensures MMAP tiles match database exactly
+   - Compares actual tile coordinates (tile_ix, tile_iy) with tiles table
+   - Checks for features.pt, labels.pt, metadata.json in each tile
+   - Detects missing or extra tiles
+   - Removes incomplete tiles in clean mode
+
+**Sequential Demotion**: When issues are found, tasks are demoted safely:
+- UPLOADED → REPROJECTED (if in MMAP) → DOWNLOADED (if file exists) → PENDING
+- REPROJECTED → DOWNLOADED (if file exists) → PENDING
+- DOWNLOADED → COMPLETED (if on Drive) → PENDING
+- COMPLETED → PENDING (if not on Drive)
 
 ## Task Status Flow
 

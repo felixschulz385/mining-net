@@ -3,15 +3,18 @@
 import logging
 from typing import Optional, List, Tuple, Dict, Any
 from pathlib import Path
-import json
+import sys
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .database import DownloadDatabase
-from .config import Config
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from config import Config
+from network.database import TileDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +29,7 @@ class MiningSegmentationDataLoader(Dataset):
     Uses memory-mapped PyTorch tensors for fast, zero-copy data access.
     
     Example:
-        >>> from data.data_loader import MiningSegmentationDataLoader
+        >>> from network.data_loader import MiningSegmentationDataLoader
         >>> from torch.utils.data import DataLoader
         >>> dataset = MiningSegmentationDataLoader(
         ...     countries=['ZAF'], 
@@ -42,7 +45,7 @@ class MiningSegmentationDataLoader(Dataset):
         self,
         db_path: Optional[str] = None,
         mmap_path: Optional[str] = None,
-        config: Optional[Config] = None,
+        config = None,
         countries: Optional[List[str]] = None,
         years: Optional[List[int]] = None,
         cluster_ids: Optional[List[int]] = None,
@@ -58,7 +61,7 @@ class MiningSegmentationDataLoader(Dataset):
         
         Args:
             db_path: Path to database (defaults to config)
-            mmap_path: Path to memory-mapped dataset (defaults to config.DATA_DIR/landsat_mmap)
+            mmap_path: Path to memory-mapped dataset (defaults to config.MMAP_DIR)
             config: Configuration instance
             countries: Filter by ISO3 country codes
             years: Filter by years
@@ -75,10 +78,10 @@ class MiningSegmentationDataLoader(Dataset):
         
         # Setup database
         db_path = db_path or str(self.config.DB_PATH)
-        self.db = DownloadDatabase(db_path)
+        self.db = TileDatabase(db_path)
         
         # Setup storage paths
-        mmap_path = mmap_path or str(self.config.DATA_DIR / "landsat_mmap")
+        mmap_path = mmap_path or str(self.config.MMAP_DIR)
         self.mmap_path = Path(mmap_path)
         
         if not self.mmap_path.exists():
@@ -142,37 +145,7 @@ class MiningSegmentationDataLoader(Dataset):
         Returns:
             List of tile dicts with metadata
         """
-        with self.db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Build query with filters
-            query = """
-                SELECT t.tile_ix, t.tile_iy, t.cluster_id, t.year, 
-                       tasks.country_code, tasks.geometry_hash
-                FROM tiles t
-                JOIN tasks ON t.geometry_hash = tasks.geometry_hash 
-                    AND t.year = tasks.year
-                WHERE t.mmap_written = 1
-            """
-            params = []
-            
-            if countries:
-                placeholders = ','.join('?' * len(countries))
-                query += f" AND tasks.country_code IN ({placeholders})"
-                params.extend(countries)
-            
-            if years:
-                placeholders = ','.join('?' * len(years))
-                query += f" AND t.year IN ({placeholders})"
-                params.extend(years)
-            
-            if cluster_ids:
-                placeholders = ','.join('?' * len(cluster_ids))
-                query += f" AND t.cluster_id IN ({placeholders})"
-                params.extend(cluster_ids)
-            
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+        return self.db.get_written_tiles(countries, years, cluster_ids)
     
     def load_tile_data(
         self,

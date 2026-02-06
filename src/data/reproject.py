@@ -219,9 +219,10 @@ class ReprojectionWorker:
             except Exception as e:
                 logger.warning(f"  Could not delete {filepath}: {e}")
             
-            # Update database
+            # Update database - set local_filepath to NULL since file is deleted
             self.db.update_task_status(
                 geometry_hash, year, self.config.STATUS_REPROJECTED,
+                local_filepath=None
             )
             
             self.db.increment_worker_counter(self.worker_name, "tasks_processed")

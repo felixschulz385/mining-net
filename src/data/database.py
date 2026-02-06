@@ -479,3 +479,19 @@ class DownloadDatabase:
                 WHERE geometry_hash = ? AND year = ?
             """, (geometry_hash, year))
             return [dict(row) for row in cursor.fetchall()]
+    
+    def get_all_cluster_years(self) -> List[Dict[str, Any]]:
+        """Get all distinct cluster_id and year combinations from database.
+        
+        Returns:
+            List of dicts with cluster_id and year
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT cluster_id, year 
+                FROM tasks 
+                WHERE cluster_id IS NOT NULL
+                ORDER BY cluster_id, year
+            """)
+            return [dict(row) for row in cursor.fetchall()]
