@@ -2,6 +2,12 @@
 
 from pathlib import Path
 from typing import Optional
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from config import Config
 
 
 class NetworkConfig:
@@ -64,12 +70,12 @@ class NetworkConfig:
     REDUCE_LR_FACTOR = 0.5
     MIN_LR = 1e-7
     
-    # Checkpointing
-    CHECKPOINT_DIR = Path(__file__).parent.parent.parent / "models" / "checkpoints"
+    # Checkpointing (uses general config)
+    CHECKPOINT_DIR = Config.CHECKPOINTS_DIR
     SAVE_BEST_ONLY = True
     
-    # TensorBoard / Logging
-    LOG_DIR = Path(__file__).parent.parent.parent / "logs"
+    # TensorBoard / Logging (uses general config)
+    LOG_DIR = Config.LOGS_DIR
     
     # Device configuration
     DEVICE = 'cuda'  # 'cuda', 'cpu', or 'mps' (for Apple Silicon)

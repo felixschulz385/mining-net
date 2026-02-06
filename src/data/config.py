@@ -28,6 +28,15 @@ class Config:
     CREDENTIALS_FILE = BASE_DIR / "secrets" / "client_secret.json"
     TOKEN_FILE = BASE_DIR / "secrets" / "token.pickle"
     
+    # HPC/Scicore settings
+    HPC_HOST = "transfer12.scicore.unibas.ch"
+    HPC_USER = "schulz0022"
+    HPC_BASE_PATH = "/scicore/home/meiera/schulz0022/projects/mining-net"
+    HPC_DATA_PATH = f"{HPC_BASE_PATH}/data"
+    HPC_ZARR_PATH = f"{HPC_DATA_PATH}/landsat_mmap"
+    HPC_BACKUP_PATH = f"{HPC_DATA_PATH}/backups"
+    SSH_KEY = Path.home() / ".ssh" / "id_ed25519_scicore"
+    
     # Worker settings
     WORKER_SLEEP_INTERVAL = 30  # seconds
     BATCH_SIZE = 10  # tasks per batch

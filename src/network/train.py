@@ -31,8 +31,8 @@ from network.utils import (
     prepare_for_training,
     plot_training_history
 )
-from data.data_loader import MiningSegmentationDataLoader
-from data.config import Config as DataConfig
+from network.data_loader import MiningSegmentationDataLoader
+from config import Config as DataConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,13 +47,13 @@ class MiningSegmentationTrainer:
     def __init__(
         self,
         network_config: Optional[NetworkConfig] = None,
-        data_config: Optional[DataConfig] = None
+        data_config = None
     ):
         """Initialize trainer.
         
         Args:
             network_config: Network configuration
-            data_config: Data configuration
+            data_config: Data configuration (from config.Config)
         """
         self.network_config = network_config or NetworkConfig()
         self.data_config = data_config or DataConfig()
