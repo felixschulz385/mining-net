@@ -1,6 +1,8 @@
 """Utility functions for training and evaluation."""
 
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional
 import matplotlib.pyplot as plt
@@ -11,69 +13,68 @@ from pathlib import Path
 # Loss Functions
 # ============================================================================
 
-def dice_loss(y_true, y_pred, smooth=1e-6):
+def dice_loss(y_pred, y_true, smooth=1e-6):
     """Dice loss for binary segmentation.
     
     Args:
-        y_true: Ground truth mask (batch, H, W, 1)
-        y_pred: Predicted mask (batch, H, W, 1)
+        y_pred: Predicted mask (batch, 1, H, W)
+        y_true: Ground truth mask (batch, 1, H, W)
         smooth: Smoothing factor
         
     Returns:
         Dice loss value
     """
-    y_true_f = tf.reshape(y_true, [-1])
-    y_pred_f = tf.reshape(y_pred, [-1])
+    y_pred_f = y_pred.view(-1)
+    y_true_f = y_true.view(-1)
     
-    intersection = tf.reduce_sum(y_true_f * y_pred_f)
-    dice = (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+    intersection = (y_pred_f * y_true_f).sum()
+    dice = (2. * intersection + smooth) / (y_pred_f.sum() + y_true_f.sum() + smooth)
     
     return 1 - dice
 
 
-def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0):
+def focal_loss(y_pred, y_true, alpha=0.25, gamma=2.0):
     """Focal loss for handling class imbalance.
     
     Args:
-        y_true: Ground truth mask
-        y_pred: Predicted mask
+        y_pred: Predicted mask (batch, 1, H, W)
+        y_true: Ground truth mask (batch, 1, H, W)
         alpha: Weighting factor
         gamma: Focusing parameter
         
     Returns:
         Focal loss value
     """
-    epsilon = tf.keras.backend.epsilon()
-    y_pred = tf.clip_by_value(y_pred, epsilon, 1. - epsilon)
+    epsilon = 1e-7
+    y_pred = torch.clamp(y_pred, epsilon, 1. - epsilon)
     
     # Calculate focal loss
-    pt_1 = tf.where(tf.equal(y_true, 1), y_pred, tf.ones_like(y_pred))
-    pt_0 = tf.where(tf.equal(y_true, 0), y_pred, tf.zeros_like(y_pred))
+    pt_1 = torch.where(y_true == 1, y_pred, torch.ones_like(y_pred))
+    pt_0 = torch.where(y_true == 0, y_pred, torch.zeros_like(y_pred))
     
-    loss = -tf.reduce_mean(
-        alpha * tf.pow(1. - pt_1, gamma) * tf.math.log(pt_1)
-    ) - tf.reduce_mean(
-        (1 - alpha) * tf.pow(pt_0, gamma) * tf.math.log(1. - pt_0)
+    loss = -torch.mean(
+        alpha * torch.pow(1. - pt_1, gamma) * torch.log(pt_1)
+    ) - torch.mean(
+        (1 - alpha) * torch.pow(pt_0, gamma) * torch.log(1. - pt_0)
     )
     
     return loss
 
 
-def combined_loss(y_true, y_pred, bce_weight=0.5, dice_weight=0.5):
+def combined_loss(y_pred, y_true, bce_weight=0.5, dice_weight=0.5):
     """Combined BCE and Dice loss.
     
     Args:
-        y_true: Ground truth mask
-        y_pred: Predicted mask
+        y_pred: Predicted mask (batch, 1, H, W)
+        y_true: Ground truth mask (batch, 1, H, W)
         bce_weight: Weight for BCE loss
         dice_weight: Weight for Dice loss
         
     Returns:
         Combined loss value
     """
-    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-    bce = tf.reduce_mean(bce)
-    dice = dice_loss(y_true, y_pred)
+    bce = F.binary_cross_entropy(y_pred, y_true)
+    dice = dice_loss(y_pred, y_true)
     
     return bce_weight * bce + dice_weight * dice
 
@@ -82,58 +83,70 @@ def combined_loss(y_true, y_pred, bce_weight=0.5, dice_weight=0.5):
 # Metrics
 # ============================================================================
 
-class DiceCoefficient(tf.keras.metrics.Metric):
+class DiceCoefficient:
     """Dice coefficient metric for segmentation."""
     
-    def __init__(self, name='dice_coefficient', smooth=1e-6, **kwargs):
-        super().__init__(name=name, **kwargs)
+    def __init__(self, smooth=1e-6):
         self.smooth = smooth
-        self.intersection = self.add_weight(name='intersection', initializer='zeros')
-        self.union = self.add_weight(name='union', initializer='zeros')
+        self.reset()
     
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred > 0.5, tf.float32)
-        
-        intersection = tf.reduce_sum(y_true * y_pred)
-        union = tf.reduce_sum(y_true) + tf.reduce_sum(y_pred)
-        
-        self.intersection.assign_add(intersection)
-        self.union.assign_add(union)
+    def reset(self):
+        """Reset metric state."""
+        self.intersection = 0.0
+        self.union = 0.0
     
-    def result(self):
+    def update(self, y_pred, y_true):
+        """Update metric with batch predictions.
+        
+        Args:
+            y_pred: Predicted mask (batch, 1, H, W)
+            y_true: Ground truth mask (batch, 1, H, W)
+        """
+        y_pred = (y_pred > 0.5).float()
+        y_true = y_true.float()
+        
+        intersection = (y_pred * y_true).sum().item()
+        union = y_pred.sum().item() + y_true.sum().item()
+        
+        self.intersection += intersection
+        self.union += union
+    
+    def compute(self):
+        """Compute dice coefficient."""
         return (2. * self.intersection + self.smooth) / (self.union + self.smooth)
-    
-    def reset_state(self):
-        self.intersection.assign(0.)
-        self.union.assign(0.)
 
 
-class IoU(tf.keras.metrics.Metric):
+class IoU:
     """Intersection over Union (IoU) metric."""
     
-    def __init__(self, name='iou', smooth=1e-6, **kwargs):
-        super().__init__(name=name, **kwargs)
+    def __init__(self, smooth=1e-6):
         self.smooth = smooth
-        self.intersection = self.add_weight(name='intersection', initializer='zeros')
-        self.union = self.add_weight(name='union', initializer='zeros')
+        self.reset()
     
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred > 0.5, tf.float32)
-        
-        intersection = tf.reduce_sum(y_true * y_pred)
-        union = tf.reduce_sum(y_true) + tf.reduce_sum(y_pred) - intersection
-        
-        self.intersection.assign_add(intersection)
-        self.union.assign_add(union)
+    def reset(self):
+        """Reset metric state."""
+        self.intersection = 0.0
+        self.union = 0.0
     
-    def result(self):
+    def update(self, y_pred, y_true):
+        """Update metric with batch predictions.
+        
+        Args:
+            y_pred: Predicted mask (batch, 1, H, W)
+            y_true: Ground truth mask (batch, 1, H, W)
+        """
+        y_pred = (y_pred > 0.5).float()
+        y_true = y_true.float()
+        
+        intersection = (y_pred * y_true).sum().item()
+        union = y_pred.sum().item() + y_true.sum().item() - intersection
+        
+        self.intersection += intersection
+        self.union += union
+    
+    def compute(self):
+        """Compute IoU."""
         return (self.intersection + self.smooth) / (self.union + self.smooth)
-    
-    def reset_state(self):
-        self.intersection.assign(0.)
-        self.union.assign(0.)
 
 
 # ============================================================================
@@ -144,46 +157,44 @@ def augment_tile(features, labels, config):
     """Apply data augmentation to a single tile.
     
     Args:
-        features: Input features (H, W, C)
-        labels: Ground truth mask (H, W, 1) or (H, W)
+        features: Input features (C, H, W) as torch tensor
+        labels: Ground truth mask (1, H, W) as torch tensor
         config: NetworkConfig instance
         
     Returns:
-        Augmented features and labels with consistent shapes
+        Augmented features and labels
     """
-    # Ensure labels have channel dimension
-    if len(labels.shape) == 2:
-        labels = labels[..., tf.newaxis]
-    
     # Random horizontal flip
     if config.FLIP_HORIZONTAL:
-        if tf.random.uniform(()) > 0.5:
-            features = tf.image.flip_left_right(features)
-            labels = tf.image.flip_left_right(labels)
+        if torch.rand(1).item() > 0.5:
+            features = torch.flip(features, dims=[2])
+            labels = torch.flip(labels, dims=[2])
     
     # Random vertical flip
     if config.FLIP_VERTICAL:
-        if tf.random.uniform(()) > 0.5:
-            features = tf.image.flip_up_down(features)
-            labels = tf.image.flip_up_down(labels)
+        if torch.rand(1).item() > 0.5:
+            features = torch.flip(features, dims=[1])
+            labels = torch.flip(labels, dims=[1])
     
     # Random 90-degree rotations
     if config.ROTATE_90:
-        k = tf.random.uniform((), 0, 4, dtype=tf.int32)
-        features = tf.image.rot90(features, k)
-        labels = tf.image.rot90(labels, k)
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            features = torch.rot90(features, k, dims=[1, 2])
+            labels = torch.rot90(labels, k, dims=[1, 2])
     
     # Random brightness adjustment (only on features)
     if config.BRIGHTNESS_DELTA > 0:
-        features = tf.image.random_brightness(features, config.BRIGHTNESS_DELTA)
+        delta = torch.rand(1).item() * config.BRIGHTNESS_DELTA * 2 - config.BRIGHTNESS_DELTA
+        features = features + delta
+        features = torch.clamp(features, 0, 1)
     
     # Random contrast adjustment (only on features)
     if config.CONTRAST_RANGE is not None:
-        features = tf.image.random_contrast(
-            features,
-            config.CONTRAST_RANGE[0],
-            config.CONTRAST_RANGE[1]
-        )
+        factor = torch.rand(1).item() * (config.CONTRAST_RANGE[1] - config.CONTRAST_RANGE[0]) + config.CONTRAST_RANGE[0]
+        mean = features.mean(dim=(1, 2), keepdim=True)
+        features = (features - mean) * factor + mean
+        features = torch.clamp(features, 0, 1)
     
     return features, labels
 
@@ -203,14 +214,28 @@ def visualize_predictions(
     """Visualize model predictions.
     
     Args:
-        features: Input features (N, H, W, C)
-        labels: Ground truth masks (N, H, W)
-        predictions: Predicted masks (N, H, W, 1)
+        features: Input features (N, C, H, W) or (N, H, W, C)
+        labels: Ground truth masks (N, 1, H, W) or (N, H, W)
+        predictions: Predicted masks (N, 1, H, W)
         band_indices: Which bands to use for RGB visualization
         num_samples: Number of samples to visualize
         save_path: Path to save figure
     """
     num_samples = min(num_samples, len(features))
+    
+    # Convert from (N, C, H, W) to (N, H, W, C) if needed
+    if features.ndim == 4 and features.shape[1] < features.shape[2]:
+        features = np.transpose(features, (0, 2, 3, 1))
+    
+    # Handle predictions shape
+    if predictions.ndim == 4 and predictions.shape[1] == 1:
+        predictions = predictions[:, 0, :, :]  # (N, H, W)
+    
+    # Handle labels shape
+    if labels.ndim == 3:
+        pass  # Already (N, H, W)
+    elif labels.ndim == 4 and labels.shape[1] == 1:
+        labels = labels[:, 0, :, :]
     
     fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
     if num_samples == 1:
@@ -218,7 +243,8 @@ def visualize_predictions(
     
     for i in range(num_samples):
         # RGB composite (normalized)
-        rgb = features[i, :, :, band_indices]
+        # Extract selected bands: features[i] is (H, W, C)
+        rgb = np.stack([features[i, :, :, b] for b in band_indices], axis=-1)
         rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
         
         axes[i, 0].imshow(rgb)
@@ -231,7 +257,7 @@ def visualize_predictions(
         axes[i, 1].axis('off')
         
         # Prediction
-        pred_mask = predictions[i, :, :, 0]
+        pred_mask = predictions[i]
         axes[i, 2].imshow(pred_mask, cmap='gray', vmin=0, vmax=1)
         axes[i, 2].set_title('Prediction')
         axes[i, 2].axis('off')
@@ -251,20 +277,18 @@ def visualize_predictions(
     plt.show()
 
 
-def plot_training_history(history, save_path: Optional[Path] = None):
+def plot_training_history(history: dict, save_path: Optional[Path] = None):
     """Plot training history.
     
     Args:
-        history: Keras History object or dict with training metrics
+        history: Dict with training metrics
         save_path: Path to save figure
     """
-    if hasattr(history, 'history'):
-        history = history.history
-    
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
     # Loss
-    axes[0, 0].plot(history['loss'], label='Train Loss')
+    if 'loss' in history:
+        axes[0, 0].plot(history['loss'], label='Train Loss')
     if 'val_loss' in history:
         axes[0, 0].plot(history['val_loss'], label='Val Loss')
     axes[0, 0].set_xlabel('Epoch')
@@ -276,8 +300,9 @@ def plot_training_history(history, save_path: Optional[Path] = None):
     # Dice coefficient
     if 'dice_coefficient' in history:
         axes[0, 1].plot(history['dice_coefficient'], label='Train Dice')
-        if 'val_dice_coefficient' in history:
-            axes[0, 1].plot(history['val_dice_coefficient'], label='Val Dice')
+    if 'val_dice_coefficient' in history:
+        axes[0, 1].plot(history['val_dice_coefficient'], label='Val Dice')
+    if 'dice_coefficient' in history or 'val_dice_coefficient' in history:
         axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].set_ylabel('Dice Coefficient')
         axes[0, 1].set_title('Dice Coefficient')
@@ -287,8 +312,9 @@ def plot_training_history(history, save_path: Optional[Path] = None):
     # IoU
     if 'iou' in history:
         axes[1, 0].plot(history['iou'], label='Train IoU')
-        if 'val_iou' in history:
-            axes[1, 0].plot(history['val_iou'], label='Val IoU')
+    if 'val_iou' in history:
+        axes[1, 0].plot(history['val_iou'], label='Val IoU')
+    if 'iou' in history or 'val_iou' in history:
         axes[1, 0].set_xlabel('Epoch')
         axes[1, 0].set_ylabel('IoU')
         axes[1, 0].set_title('Intersection over Union')
@@ -317,39 +343,43 @@ def plot_training_history(history, save_path: Optional[Path] = None):
 # Data Processing
 # ============================================================================
 
-def normalize_features(features: tf.Tensor) -> tf.Tensor:
+def normalize_features(features: torch.Tensor) -> torch.Tensor:
     """Normalize features to [0, 1] range.
     
     Args:
-        features: Input features
+        features: Input features (C, H, W)
         
     Returns:
         Normalized features
     """
     # Simple min-max normalization per band
-    min_val = tf.reduce_min(features, axis=[0, 1], keepdims=True)
-    max_val = tf.reduce_max(features, axis=[0, 1], keepdims=True)
+    min_val = features.min()
+    max_val = features.max()
     
     normalized = (features - min_val) / (max_val - min_val + 1e-8)
     return normalized
 
 
 def prepare_for_training(features, labels):
-    """Prepare data for training.
+    """Prepare data for training with PyTorch.
     
     Args:
-        features: Input features (H, W, C)
-        labels: Ground truth mask (H, W)
+        features: Input features (H, W, C) as numpy array
+        labels: Ground truth mask (H, W) as numpy array
         
     Returns:
-        Processed features and labels
+        Processed features and labels as torch tensors (C, H, W) and (1, H, W)
     """
-    # Ensure correct dtypes
-    features = tf.cast(features, tf.float32)
-    labels = tf.cast(labels, tf.float32)
+    # Convert to torch tensors
+    features = torch.from_numpy(features).float()
+    labels = torch.from_numpy(labels).float()
+    
+    # Transpose features from (H, W, C) to (C, H, W)
+    if features.ndim == 3:
+        features = features.permute(2, 0, 1)
     
     # Add channel dimension to labels if needed
-    if len(labels.shape) == 2:
-        labels = labels[..., tf.newaxis]
+    if labels.ndim == 2:
+        labels = labels.unsqueeze(0)  # (1, H, W)
     
     return features, labels

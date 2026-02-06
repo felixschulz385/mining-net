@@ -8,9 +8,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
 
-import tensorflow as tf
-from tensorflow import keras
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+from tqdm import tqdm
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -57,82 +61,79 @@ class MiningSegmentationTrainer:
         # Create necessary directories
         self.network_config.create_directories()
         
-        # Initialize data loader
-        self.data_loader = MiningSegmentationDataLoader(config=self.data_config)
+        # Setup device
+        if self.network_config.DEVICE == 'cuda' and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        elif self.network_config.DEVICE == 'mps' and torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+            logger.info("Using Apple Silicon GPU")
+        else:
+            self.device = torch.device('cpu')
+            logger.info("Using CPU")
         
         # Model will be initialized in setup_model
         self.model = None
-        
-        # Setup mixed precision if enabled
-        if self.network_config.USE_MIXED_PRECISION:
-            policy = tf.keras.mixed_precision.Policy('mixed_float16')
-            tf.keras.mixed_precision.set_global_policy(policy)
-            logger.info("Mixed precision training enabled")
+        self.optimizer = None
+        self.scheduler = None
     
     def setup_model(self):
-        """Build and compile the model."""
+        """Build and setup the model."""
         logger.info("Building UNet model...")
         
         # Build model
         self.model = build_unet(
-            input_shape=self.network_config.INPUT_SHAPE,
+            in_channels=self.network_config.IN_CHANNELS,
             num_classes=self.network_config.NUM_CLASSES,
             filters_base=self.network_config.FILTERS_BASE,
             depth=self.network_config.DEPTH,
             dropout_rate=self.network_config.DROPOUT_RATE
         )
         
-        # Setup optimizer with learning rate schedule
-        lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-            initial_learning_rate=self.network_config.LEARNING_RATE,
-            decay_steps=self.network_config.DECAY_STEPS,
-            decay_rate=self.network_config.LEARNING_RATE_DECAY,
-            staircase=True
+        # Move model to device
+        self.model = self.model.to(self.device)
+        
+        # Setup optimizer
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.network_config.LEARNING_RATE
         )
-        optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
         
-        # Use mixed precision optimizer if enabled
-        if self.network_config.USE_MIXED_PRECISION:
-            optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+        # Setup learning rate scheduler (ReduceLROnPlateau is better for convergence)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            factor=self.network_config.REDUCE_LR_FACTOR,
+            patience=self.network_config.REDUCE_LR_PATIENCE,
+            min_lr=self.network_config.MIN_LR
+        )
         
-        # Select loss function
+        # Count parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        logger.info(f"Total parameters: {total_params:,}")
+        logger.info(f"Trainable parameters: {trainable_params:,}")
+    
+    def get_loss_function(self):
+        """Get loss function based on configuration."""
         if self.network_config.LOSS_TYPE == 'bce':
-            loss_fn = tf.keras.losses.BinaryCrossentropy()
+            return nn.BCELoss()
         elif self.network_config.LOSS_TYPE == 'dice':
-            loss_fn = dice_loss
+            return dice_loss
         elif self.network_config.LOSS_TYPE == 'focal':
-            loss_fn = lambda y_t, y_p: focal_loss(
-                y_t, y_p,
+            return lambda pred, true: focal_loss(
+                pred, true,
                 alpha=self.network_config.FOCAL_ALPHA,
                 gamma=self.network_config.FOCAL_GAMMA
             )
         elif self.network_config.LOSS_TYPE == 'combined':
-            loss_fn = lambda y_t, y_p: combined_loss(
-                y_t, y_p,
+            return lambda pred, true: combined_loss(
+                pred, true,
                 bce_weight=self.network_config.BCE_WEIGHT,
                 dice_weight=self.network_config.DICE_WEIGHT
             )
         else:
             raise ValueError(f"Unknown loss type: {self.network_config.LOSS_TYPE}")
-        
-        # Compile model
-        metrics = [
-            'accuracy',
-            DiceCoefficient(),
-            IoU(),
-            tf.keras.metrics.Precision(name='precision'),
-            tf.keras.metrics.Recall(name='recall'),
-            tf.keras.metrics.AUC(name='auc')
-        ]
-        
-        self.model.compile(
-            optimizer=optimizer,
-            loss=loss_fn,
-            metrics=metrics
-        )
-        
-        logger.info("Model compiled successfully")
-        self.model.summary(print_fn=logger.info)
     
     def create_datasets(
         self,
@@ -148,182 +149,158 @@ class MiningSegmentationTrainer:
             cluster_ids: Filter by cluster IDs
             
         Returns:
-            Tuple of (train_dataset, val_dataset)
+            Tuple of (train_loader, val_loader)
         """
         logger.info("Creating datasets...")
         
-        # Get all available tiles
-        tiles = self.data_loader.get_written_tiles(countries, years, cluster_ids)
+        # Create full dataset with filters and normalization
+        # auto_compute_stats=True will compute statistics once during init if not provided
+        full_dataset = MiningSegmentationDataLoader(
+            config=self.data_config,
+            countries=countries,
+            years=years,
+            cluster_ids=cluster_ids,
+            bands=self.network_config.INPUT_BANDS,
+            normalize=self.network_config.NORMALIZE_INPUTS,
+            band_means=self.network_config.BAND_MEANS,
+            band_stds=self.network_config.BAND_STDS,
+            auto_compute_stats=True,  # Compute once during init for speed
+            stats_samples=100  # Use 100 samples for quick stats
+        )
         
-        if not tiles:
-            raise ValueError("No tiles found matching the specified filters")
-        
-        logger.info(f"Found {len(tiles)} tiles")
+        logger.info(f"Found {len(full_dataset)} tiles")
         
         # Split into train and validation
-        np.random.shuffle(tiles)
-        n_val = int(len(tiles) * self.network_config.VALIDATION_SPLIT)
-        val_tiles = tiles[:n_val]
-        train_tiles = tiles[n_val:]
+        n_total = len(full_dataset)
+        n_val = int(n_total * self.network_config.VALIDATION_SPLIT)
+        n_train = n_total - n_val
         
-        logger.info(f"Training tiles: {len(train_tiles)}, Validation tiles: {len(val_tiles)}")
+        # Random split
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset,
+            [n_train, n_val],
+            generator=torch.Generator().manual_seed(42)
+        )
         
-        # Create datasets
-        train_dataset = self._create_dataset_from_tiles(
-            train_tiles,
+        logger.info(f"Training tiles: {len(train_dataset)}, Validation tiles: {len(val_dataset)}")
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.network_config.BATCH_SIZE,
             shuffle=True,
-            augment=self.network_config.USE_AUGMENTATION
+            num_workers=self.network_config.NUM_WORKERS,
+            pin_memory=self.network_config.PIN_MEMORY
         )
         
-        val_dataset = self._create_dataset_from_tiles(
-            val_tiles,
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.network_config.BATCH_SIZE,
             shuffle=False,
-            augment=False
+            num_workers=self.network_config.NUM_WORKERS,
+            pin_memory=self.network_config.PIN_MEMORY
         )
         
-        return train_dataset, val_dataset
+        return train_loader, val_loader
     
-    def _create_dataset_from_tiles(
-        self,
-        tiles: List[dict],
-        shuffle: bool = True,
-        augment: bool = False
-    ):
-        """Create TensorFlow dataset from tile list.
+    def train_epoch(self, train_loader, loss_fn, epoch):
+        """Train for one epoch.
         
         Args:
-            tiles: List of tile metadata dicts
-            shuffle: Whether to shuffle
-            augment: Whether to apply augmentation
+            train_loader: Training data loader
+            loss_fn: Loss function
+            epoch: Current epoch number
             
         Returns:
-            tf.data.Dataset
+            Dict of training metrics
         """
-        # Use data loader's create_tf_dataset method for consistency
-        # This ensures proper shape handling
-        logger.info(f"Creating dataset from {len(tiles)} tiles")
+        self.model.train()
         
-        tile_indices = [(t['tile_ix'], t['tile_iy']) for t in tiles]
+        epoch_loss = 0.0
+        dice_metric = DiceCoefficient()
+        iou_metric = IoU()
+        total_grad_norm = 0.0
+        num_batches = 0
         
-        def tile_generator():
-            for tile_ix, tile_iy in tile_indices:
-                try:
-                    features, labels = self.data_loader.load_tile_data(
-                        tile_ix,
-                        tile_iy,
-                        bands=self.network_config.INPUT_BANDS,
-                        include_footprint=True
-                    )
-                    
-                    # Skip tiles with all NaN
-                    if not np.all(np.isnan(features)):
-                        # Replace NaN with 0
-                        features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-                        labels = np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
-                        
-                        # Ensure labels have shape (H, W, 1)
-                        if labels.ndim == 2:
-                            labels = labels[..., np.newaxis]
-                        
-                        yield features, labels
-                        
-                except Exception as e:
-                    logger.warning(f"Error loading tile ({tile_ix}, {tile_iy}): {e}")
-                    continue
-        
-        # Create dataset with consistent shapes
-        tile_size = self.network_config.INPUT_SHAPE[0]
-        n_bands = self.network_config.INPUT_SHAPE[2]
-        
-        dataset = tf.data.Dataset.from_generator(
-            tile_generator,
-            output_signature=(
-                tf.TensorSpec(
-                    shape=(tile_size, tile_size, n_bands),
-                    dtype=tf.float32
-                ),
-                tf.TensorSpec(
-                    shape=(tile_size, tile_size, 1),
-                    dtype=tf.float32
-                )
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
+        for features, labels in pbar:
+            # Move to device
+            features = features.to(self.device)
+            labels = labels.to(self.device)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            predictions = self.model(features)
+            loss = loss_fn(predictions, labels)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Compute gradient norm before clipping (for monitoring)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.network_config.GRADIENT_CLIP_VALUE if hasattr(self.network_config, 'GRADIENT_CLIP_VALUE') else float('inf')
             )
-        )
+            total_grad_norm += grad_norm.item()
+            num_batches += 1
+            
+            self.optimizer.step()
+            
+            # Update metrics
+            epoch_loss += loss.item()
+            dice_metric.update(predictions.detach(), labels)
+            iou_metric.update(predictions.detach(), labels)
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': loss.item()})
         
-        # Apply augmentation if requested (data is already prepared with correct shapes)
-        if augment:
-            dataset = dataset.map(
-                lambda f, l: augment_tile(f, l, self.network_config),
-                num_parallel_calls=tf.data.AUTOTUNE
-            )
+        metrics = {
+            'loss': epoch_loss / len(train_loader),
+            'dice_coefficient': dice_metric.compute(),
+            'iou': iou_metric.compute(),
+            'avg_grad_norm': total_grad_norm / num_batches if num_batches > 0 else 0.0
+        }
         
-        # Shuffle and batch
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=1000)
-        
-        dataset = dataset.batch(self.network_config.BATCH_SIZE)
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
-        
-        return dataset
+        return metrics
     
-    def setup_callbacks(self, run_name: str):
-        """Setup training callbacks.
+    def validate(self, val_loader, loss_fn):
+        """Validate the model.
         
         Args:
-            run_name: Name for this training run
+            val_loader: Validation data loader
+            loss_fn: Loss function
             
         Returns:
-            List of callbacks
+            Dict of validation metrics
         """
-        callbacks = []
+        self.model.eval()
         
-        # Model checkpoint
-        checkpoint_path = self.network_config.CHECKPOINT_DIR / f"{run_name}_best.h5"
-        checkpoint = tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(checkpoint_path),
-            monitor='val_loss',
-            save_best_only=self.network_config.SAVE_BEST_ONLY,
-            save_weights_only=self.network_config.SAVE_WEIGHTS_ONLY,
-            verbose=1
-        )
-        callbacks.append(checkpoint)
+        val_loss = 0.0
+        dice_metric = DiceCoefficient()
+        iou_metric = IoU()
         
-        # Early stopping
-        early_stopping = tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=self.network_config.EARLY_STOPPING_PATIENCE,
-            restore_best_weights=True,
-            verbose=1
-        )
-        callbacks.append(early_stopping)
+        with torch.no_grad():
+            for features, labels in tqdm(val_loader, desc="Validating"):
+                # Move to device
+                features = features.to(self.device)
+                labels = labels.to(self.device)
+                
+                # Forward pass
+                predictions = self.model(features)
+                loss = loss_fn(predictions, labels)
+                
+                # Update metrics
+                val_loss += loss.item()
+                dice_metric.update(predictions, labels)
+                iou_metric.update(predictions, labels)
         
-        # Reduce learning rate on plateau
-        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=self.network_config.REDUCE_LR_FACTOR,
-            patience=self.network_config.REDUCE_LR_PATIENCE,
-            min_lr=self.network_config.MIN_LR,
-            verbose=1
-        )
-        callbacks.append(reduce_lr)
+        metrics = {
+            'val_loss': val_loss / len(val_loader),
+            'val_dice_coefficient': dice_metric.compute(),
+            'val_iou': iou_metric.compute()
+        }
         
-        # TensorBoard
-        log_dir = self.network_config.LOG_DIR / run_name
-        tensorboard = tf.keras.callbacks.TensorBoard(
-            log_dir=str(log_dir),
-            update_freq=self.network_config.UPDATE_FREQ,
-            histogram_freq=1
-        )
-        callbacks.append(tensorboard)
-        
-        # CSV logger
-        csv_path = self.network_config.CHECKPOINT_DIR / f"{run_name}_history.csv"
-        csv_logger = tf.keras.callbacks.CSVLogger(str(csv_path))
-        callbacks.append(csv_logger)
-        
-        logger.info(f"Callbacks configured. Checkpoint: {checkpoint_path}")
-        logger.info(f"TensorBoard logs: {log_dir}")
-        
-        return callbacks
+        return metrics
     
     def train(
         self,
@@ -341,58 +318,138 @@ class MiningSegmentationTrainer:
             run_name: Name for this training run
             
         Returns:
-            Training history
+            Training history dict
         """
-        # Generate run name if not provided
-        if run_name is None:
-            run_name = f"unet_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        logger.info(f"Starting training run: {run_name}")
-        
-        # Setup model if not already done
-        if self.model is None:
-            self.setup_model()
+        # Setup model
+        self.setup_model()
         
         # Create datasets
-        train_dataset, val_dataset = self.create_datasets(
-            countries=countries,
-            years=years,
-            cluster_ids=cluster_ids
-        )
+        train_loader, val_loader = self.create_datasets(countries, years, cluster_ids)
         
-        # Setup callbacks
-        callbacks = self.setup_callbacks(run_name)
+        # Get loss function
+        loss_fn = self.get_loss_function()
         
-        # Train model
-        logger.info(f"Training for {self.network_config.EPOCHS} epochs...")
-        history = self.model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            epochs=self.network_config.EPOCHS,
-            callbacks=callbacks,
-            verbose=1
-        )
+        # Setup run name
+        if run_name is None:
+            run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
         
+        # Setup tensorboard
+        log_dir = self.network_config.LOG_DIR / run_name
+        log_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir)
+        
+        # Setup checkpointing
+        checkpoint_dir = self.network_config.CHECKPOINT_DIR / run_name
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Starting training: {run_name}")
+        logger.info(f"Checkpoints: {checkpoint_dir}")
+        logger.info(f"Logs: {log_dir}")
+        
+        # Training history
+        history = {
+            'loss': [],
+            'dice_coefficient': [],
+            'iou': [],
+            'val_loss': [],
+            'val_dice_coefficient': [],
+            'val_iou': [],
+            'lr': []
+        }
+        
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        # Training loop
+        for epoch in range(self.network_config.EPOCHS):
+            # Train
+            train_metrics = self.train_epoch(train_loader, loss_fn, epoch)
+            
+            # Validate
+            val_metrics = self.validate(val_loader, loss_fn)
+            
+            # Update history
+            history['loss'].append(train_metrics['loss'])
+            history['dice_coefficient'].append(train_metrics['dice_coefficient'])
+            history['iou'].append(train_metrics['iou'])
+            history['val_loss'].append(val_metrics['val_loss'])
+            history['val_dice_coefficient'].append(val_metrics['val_dice_coefficient'])
+            history['val_iou'].append(val_metrics['val_iou'])
+            history['lr'].append(self.optimizer.param_groups[0]['lr'])
+            
+            # Log to tensorboard
+            writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
+            writer.add_scalar('Loss/val', val_metrics['val_loss'], epoch)
+            writer.add_scalar('Dice/train', train_metrics['dice_coefficient'], epoch)
+            writer.add_scalar('Dice/val', val_metrics['val_dice_coefficient'], epoch)
+            writer.add_scalar('IoU/train', train_metrics['iou'], epoch)
+            writer.add_scalar('IoU/val', val_metrics['val_iou'], epoch)
+            writer.add_scalar('LearningRate', history['lr'][-1], epoch)
+            writer.add_scalar('Diagnostics/avg_grad_norm', train_metrics.get('avg_grad_norm', 0), epoch)
+            
+            # Log to console
+            logger.info(
+                f"Epoch {epoch + 1}/{self.network_config.EPOCHS} - "
+                f"Loss: {train_metrics['loss']:.4f} - "
+                f"Val Loss: {val_metrics['val_loss']:.4f} - "
+                f"Dice: {train_metrics['dice_coefficient']:.4f} - "
+                f"Val Dice: {val_metrics['val_dice_coefficient']:.4f} - "
+                f"GradNorm: {train_metrics.get('avg_grad_norm', 0):.4f} - "
+                f"LR: {history['lr'][-1]:.2e}"
+            )
+            
+            # Save checkpoint
+            checkpoint_path = checkpoint_dir / f"epoch_{epoch + 1:03d}.pth"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'history': history
+            }, checkpoint_path)
+            
+            # Save best model
+            if val_metrics['val_loss'] < best_val_loss:
+                best_val_loss = val_metrics['val_loss']
+                best_path = checkpoint_dir / "best_model.pth"
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'val_loss': best_val_loss
+                }, best_path)
+                logger.info(f"Saved best model with val_loss: {best_val_loss:.4f}")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            # Early stopping
+            if patience_counter >= self.network_config.EARLY_STOPPING_PATIENCE:
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+            
+            # Learning rate scheduling (ReduceLROnPlateau needs val_loss)
+            self.scheduler.step(val_metrics['val_loss'])
+        
+        writer.close()
         logger.info("Training completed!")
         
-        # Plot and save training history
-        plot_path = self.network_config.CHECKPOINT_DIR / f"{run_name}_history.png"
+        # Plot training history
+        plot_path = checkpoint_dir / "training_history.png"
         plot_training_history(history, save_path=plot_path)
         
         return history
     
-    def load_weights(self, checkpoint_path: str):
-        """Load model weights from checkpoint.
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model from checkpoint.
         
         Args:
             checkpoint_path: Path to checkpoint file
         """
-        if self.model is None:
-            self.setup_model()
-        
-        logger.info(f"Loading weights from {checkpoint_path}")
-        self.model.load_weights(checkpoint_path)
-        logger.info("Weights loaded successfully")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        logger.info(f"Loaded checkpoint from {checkpoint_path}")
 
 
 def main():

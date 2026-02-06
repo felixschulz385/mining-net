@@ -38,4 +38,4 @@ __all__ = [
     'plot_training_history'
 ]
 
-__version__ = '1.0.0'
+__version__ = '2.0.0'  # Updated for PyTorch

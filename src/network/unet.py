@@ -3,146 +3,144 @@
 This module implements a comprehensive UNet model for semantic segmentation
 of mining areas from multi-spectral Landsat imagery.
 """
-
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, Model
+import torch
+import torch.nn as nn
 from typing import Tuple, Optional
 
 
-class ConvBlock(layers.Layer):
+class ConvBlock(nn.Module):
     """Convolutional block with two conv layers, batch norm, and ReLU."""
     
     def __init__(
         self,
-        filters: int,
+        in_channels: int,
+        out_channels: int,
         kernel_size: int = 3,
-        dropout_rate: float = 0.0,
-        name: str = "conv_block"
+        dropout_rate: float = 0.0
     ):
         """Initialize convolutional block.
         
         Args:
-            filters: Number of filters
+            in_channels: Number of input channels
+            out_channels: Number of output channels
             kernel_size: Size of convolutional kernel
             dropout_rate: Dropout rate (0 = no dropout)
-            name: Block name
         """
-        super().__init__(name=name)
-        self.filters = filters
-        self.kernel_size = kernel_size
-        self.dropout_rate = dropout_rate
+        super().__init__()
         
         # First convolution
-        self.conv1 = layers.Conv2D(
-            filters,
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
             kernel_size,
-            padding='same',
-            kernel_initializer='he_normal'
+            padding=kernel_size // 2
         )
-        self.bn1 = layers.BatchNormalization()
-        self.relu1 = layers.ReLU()
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
         
         # Second convolution
-        self.conv2 = layers.Conv2D(
-            filters,
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
             kernel_size,
-            padding='same',
-            kernel_initializer='he_normal'
+            padding=kernel_size // 2
         )
-        self.bn2 = layers.BatchNormalization()
-        self.relu2 = layers.ReLU()
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu2 = nn.ReLU(inplace=True)
         
         # Optional dropout
-        if dropout_rate > 0:
-            self.dropout = layers.Dropout(dropout_rate)
-        else:
-            self.dropout = None
+        self.dropout = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else None
     
-    def call(self, inputs, training=False):
+    def forward(self, x):
         """Forward pass."""
-        x = self.conv1(inputs)
-        x = self.bn1(x, training=training)
+        x = self.conv1(x)
+        x = self.bn1(x)
         x = self.relu1(x)
         
         x = self.conv2(x)
-        x = self.bn2(x, training=training)
+        x = self.bn2(x)
         x = self.relu2(x)
         
         if self.dropout is not None:
-            x = self.dropout(x, training=training)
+            x = self.dropout(x)
         
         return x
 
 
-class EncoderBlock(layers.Layer):
+class EncoderBlock(nn.Module):
     """Encoder block with conv block and max pooling."""
     
     def __init__(
         self,
-        filters: int,
-        dropout_rate: float = 0.0,
-        name: str = "encoder_block"
+        in_channels: int,
+        out_channels: int,
+        dropout_rate: float = 0.0
     ):
         """Initialize encoder block.
         
         Args:
-            filters: Number of filters
+            in_channels: Number of input channels
+            out_channels: Number of output channels
             dropout_rate: Dropout rate
-            name: Block name
         """
-        super().__init__(name=name)
-        self.conv_block = ConvBlock(filters, dropout_rate=dropout_rate)
-        self.pool = layers.MaxPooling2D(pool_size=(2, 2))
+        super().__init__()
+        self.conv_block = ConvBlock(in_channels, out_channels, dropout_rate=dropout_rate)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
     
-    def call(self, inputs, training=False):
-        """Forward pass."""
-        x = self.conv_block(inputs, training=training)
-        p = self.pool(x)
-        return x, p
+    def forward(self, x):
+        """Forward pass.
+        
+        Returns:
+            Tuple of (skip_connection, pooled_output)
+        """
+        skip = self.conv_block(x)
+        pooled = self.pool(skip)
+        return skip, pooled
 
 
-class DecoderBlock(layers.Layer):
+class DecoderBlock(nn.Module):
     """Decoder block with upsampling, concatenation, and conv block."""
     
     def __init__(
         self,
-        filters: int,
-        dropout_rate: float = 0.0,
-        name: str = "decoder_block"
+        in_channels: int,
+        out_channels: int,
+        dropout_rate: float = 0.0
     ):
         """Initialize decoder block.
         
         Args:
-            filters: Number of filters
+            in_channels: Number of input channels
+            out_channels: Number of output channels
             dropout_rate: Dropout rate
-            name: Block name
         """
-        super().__init__(name=name)
-        self.upconv = layers.Conv2DTranspose(
-            filters,
+        super().__init__()
+        self.upconv = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
             kernel_size=2,
-            strides=2,
-            padding='same'
+            stride=2
         )
-        self.concat = layers.Concatenate()
-        self.conv_block = ConvBlock(filters, dropout_rate=dropout_rate)
+        self.conv_block = ConvBlock(
+            in_channels,  # Concatenated channels (out_channels + out_channels from skip)
+            out_channels,
+            dropout_rate=dropout_rate
+        )
     
-    def call(self, inputs, skip_connection, training=False):
+    def forward(self, x, skip_connection):
         """Forward pass.
         
         Args:
-            inputs: Input tensor from previous layer
+            x: Input tensor from previous layer
             skip_connection: Skip connection from encoder
-            training: Training mode
         """
-        x = self.upconv(inputs)
-        x = self.concat([x, skip_connection])
-        x = self.conv_block(x, training=training)
+        x = self.upconv(x)
+        x = torch.cat([x, skip_connection], dim=1)
+        x = self.conv_block(x)
         return x
 
 
-class UNet(Model):
+class UNet(nn.Module):
     """UNet model for mining segmentation.
     
     Architecture:
@@ -152,155 +150,138 @@ class UNet(Model):
         - Output: Single channel with sigmoid activation for binary segmentation
     
     Input:
-        - Shape: (batch, 64, 64, 7) - 7 Landsat bands
+        - Shape: (batch, 7, 64, 64) - 7 Landsat bands
         - Bands: [blue, green, red, nir, swir1, swir2, thermal]
     
     Output:
-        - Shape: (batch, 64, 64, 1) - Binary mining footprint mask
+        - Shape: (batch, 1, 64, 64) - Binary mining footprint mask
         - Values: [0, 1] probability of mining pixel
     """
     
     def __init__(
         self,
-        input_shape: Tuple[int, int, int] = (64, 64, 7),
+        in_channels: int = 7,
         num_classes: int = 1,
         filters_base: int = 64,
         depth: int = 4,
-        dropout_rate: float = 0.1,
-        name: str = "unet"
+        dropout_rate: float = 0.1
     ):
         """Initialize UNet model.
         
         Args:
-            input_shape: Input shape (height, width, channels)
+            in_channels: Number of input channels
             num_classes: Number of output classes (1 for binary)
             filters_base: Base number of filters (doubled at each level)
             depth: Depth of encoder/decoder (number of pooling operations)
             dropout_rate: Dropout rate for regularization
-            name: Model name
         """
-        super().__init__(name=name)
+        super().__init__()
         
-        self.input_shape_ = input_shape
+        self.in_channels = in_channels
         self.num_classes = num_classes
         self.filters_base = filters_base
         self.depth = depth
         self.dropout_rate = dropout_rate
         
         # Build encoder blocks
-        self.encoders = []
+        self.encoders = nn.ModuleList()
+        current_channels = in_channels
         for i in range(depth):
-            filters = filters_base * (2 ** i)
+            out_channels = filters_base * (2 ** i)
             self.encoders.append(
                 EncoderBlock(
-                    filters,
-                    dropout_rate=dropout_rate,
-                    name=f"encoder_{i}"
+                    current_channels,
+                    out_channels,
+                    dropout_rate=dropout_rate
                 )
             )
+            current_channels = out_channels
         
         # Bottleneck
         bottleneck_filters = filters_base * (2 ** depth)
         self.bottleneck = ConvBlock(
+            current_channels,
             bottleneck_filters,
-            dropout_rate=dropout_rate,
-            name="bottleneck"
+            dropout_rate=dropout_rate
         )
         
         # Build decoder blocks
-        self.decoders = []
+        self.decoders = nn.ModuleList()
+        current_channels = bottleneck_filters
         for i in range(depth - 1, -1, -1):
-            filters = filters_base * (2 ** i)
+            out_channels = filters_base * (2 ** i)
             self.decoders.append(
                 DecoderBlock(
-                    filters,
-                    dropout_rate=dropout_rate,
-                    name=f"decoder_{i}"
+                    current_channels,
+                    out_channels,
+                    dropout_rate=dropout_rate
                 )
             )
+            current_channels = out_channels
         
         # Output layer
-        self.output_layer = layers.Conv2D(
-            num_classes,
-            kernel_size=1,
-            activation='sigmoid',
-            name='output'
+        self.output_layer = nn.Sequential(
+            nn.Conv2d(current_channels, num_classes, kernel_size=1),
+            nn.Sigmoid()
         )
     
-    def call(self, inputs, training=False):
+    def forward(self, x):
         """Forward pass.
         
         Args:
-            inputs: Input tensor of shape (batch, H, W, C)
-            training: Training mode
+            x: Input tensor of shape (batch, C, H, W)
             
         Returns:
-            Output tensor of shape (batch, H, W, num_classes)
+            Output tensor of shape (batch, num_classes, H, W)
         """
         # Encoder path
         skip_connections = []
-        x = inputs
         
         for encoder in self.encoders:
-            skip, x = encoder(x, training=training)
+            skip, x = encoder(x)
             skip_connections.append(skip)
         
         # Bottleneck
-        x = self.bottleneck(x, training=training)
+        x = self.bottleneck(x)
         
         # Decoder path
         skip_connections = skip_connections[::-1]  # Reverse for decoder
         
         for decoder, skip in zip(self.decoders, skip_connections):
-            x = decoder(x, skip, training=training)
+            x = decoder(x, skip)
         
         # Output
         outputs = self.output_layer(x)
         
         return outputs
-    
-    def get_config(self):
-        """Get configuration for serialization."""
-        return {
-            'input_shape': self.input_shape_,
-            'num_classes': self.num_classes,
-            'filters_base': self.filters_base,
-            'depth': self.depth,
-            'dropout_rate': self.dropout_rate,
-            'name': self.name
-        }
 
 
 def build_unet(
-    input_shape: Tuple[int, int, int] = (64, 64, 7),
+    in_channels: int = 7,
     num_classes: int = 1,
     filters_base: int = 64,
     depth: int = 4,
     dropout_rate: float = 0.1
-) -> Model:
-    """Build and compile UNet model.
+) -> UNet:
+    """Build UNet model.
     
     Args:
-        input_shape: Input shape (height, width, channels)
+        in_channels: Number of input channels
         num_classes: Number of output classes
         filters_base: Base number of filters
         depth: Depth of encoder/decoder
         dropout_rate: Dropout rate
         
     Returns:
-        Compiled Keras model
+        UNet model
     """
     model = UNet(
-        input_shape=input_shape,
+        in_channels=in_channels,
         num_classes=num_classes,
         filters_base=filters_base,
         depth=depth,
         dropout_rate=dropout_rate
     )
-    
-    # Build model by calling it once
-    dummy_input = tf.zeros((1, *input_shape))
-    _ = model(dummy_input)
     
     return model
 
@@ -308,10 +289,16 @@ def build_unet(
 if __name__ == "__main__":
     # Example usage
     model = build_unet()
-    model.summary()
+    print(model)
     
     # Test with random input
-    test_input = tf.random.normal((2, 64, 64, 7))
+    test_input = torch.randn(2, 7, 64, 64)
     test_output = model(test_input)
     print(f"\nInput shape: {test_input.shape}")
     print(f"Output shape: {test_output.shape}")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nTotal parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")

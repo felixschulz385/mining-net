@@ -136,3 +136,6 @@ logs/
 
 # Secrets
 /secrets
+
+# Models
+/models

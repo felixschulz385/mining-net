@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-import tensorflow as tf
+import torch
 import numpy as np
 from tqdm import tqdm
 
@@ -52,21 +52,32 @@ class MiningSegmentationEvaluator:
         self.data_config = data_config or DataConfig()
         self.checkpoint_path = checkpoint_path
         
-        # Initialize data loader
-        self.data_loader = MiningSegmentationDataLoader(config=self.data_config)
+        # Setup device
+        if self.network_config.DEVICE == 'cuda' and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        elif self.network_config.DEVICE == 'mps' and torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+            logger.info("Using Apple Silicon GPU")
+        else:
+            self.device = torch.device('cpu')
+            logger.info("Using CPU")
+        
+        # Initialize data loader (will be created per-need for tile access)
+        self.data_config = data_config
         
         # Build and load model
         self.model = self._load_model()
     
-    def _load_model(self) -> tf.keras.Model:
+    def _load_model(self) -> torch.nn.Module:
         """Load model from checkpoint.
         
         Returns:
-            Loaded Keras model
+            Loaded PyTorch model
         """
         logger.info("Building model...")
         model = build_unet(
-            input_shape=self.network_config.INPUT_SHAPE,
+            in_channels=self.network_config.IN_CHANNELS,
             num_classes=self.network_config.NUM_CLASSES,
             filters_base=self.network_config.FILTERS_BASE,
             depth=self.network_config.DEPTH,
@@ -74,7 +85,17 @@ class MiningSegmentationEvaluator:
         )
         
         logger.info(f"Loading weights from {self.checkpoint_path}")
-        model.load_weights(self.checkpoint_path)
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        
+        model = model.to(self.device)
+        model.eval()
+        
         logger.info("Model loaded successfully")
         
         return model
@@ -99,90 +120,53 @@ class MiningSegmentationEvaluator:
         """
         logger.info("Starting evaluation...")
         
-        # Get test tiles
-        tiles = self.data_loader.get_written_tiles(countries, years, cluster_ids)
+        # Create dataset
+        dataset = MiningSegmentationDataLoader(
+            config=self.data_config,
+            countries=countries,
+            years=years,
+            cluster_ids=cluster_ids,
+            bands=self.network_config.INPUT_BANDS
+        )
         
-        if not tiles:
-            raise ValueError("No tiles found matching the specified filters")
+        if len(dataset) == 0:
+            raise ValueError("No tiles found with specified filters")
         
-        logger.info(f"Evaluating on {len(tiles)} tiles")
+        logger.info(f"Evaluating on {len(dataset)} tiles")
+        
+        # Create data loader
+        from torch.utils.data import DataLoader
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=self.network_config.NUM_WORKERS,
+            pin_memory=self.network_config.PIN_MEMORY
+        )
         
         # Initialize metrics
         dice_metric = DiceCoefficient()
         iou_metric = IoU()
-        precision_metric = tf.keras.metrics.Precision()
-        recall_metric = tf.keras.metrics.Recall()
-        auc_metric = tf.keras.metrics.AUC()
         
-        # Process tiles in batches
-        for i in tqdm(range(0, len(tiles), batch_size)):
-            batch_tiles = tiles[i:i + batch_size]
-            
-            features_batch = []
-            labels_batch = []
-            
-            for tile in batch_tiles:
-                try:
-                    features, labels = self.data_loader.load_tile_data(
-                        tile['tile_ix'],
-                        tile['tile_iy'],
-                        bands=self.network_config.INPUT_BANDS,
-                        include_footprint=True
-                    )
-                    
-                    # Skip invalid tiles
-                    if np.all(np.isnan(features)):
-                        continue
-                    
-                    # Replace NaN with 0
-                    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-                    labels = np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
-                    
-                    # Ensure labels have shape (H, W, 1)
-                    if labels.ndim == 2:
-                        labels = labels[..., np.newaxis]
-                    
-                    features_batch.append(features)
-                    labels_batch.append(labels)
-                    
-                except Exception as e:
-                    logger.warning(f"Error loading tile: {e}")
-                    continue
-            
-            if not features_batch:
-                continue
-            
-            # Convert to arrays (labels already have shape (H, W, 1))
-            features_batch = np.array(features_batch, dtype=np.float32)
-            labels_batch = np.array(labels_batch, dtype=np.float32)
-            
-            # Predict
-            predictions = self.model.predict(features_batch, verbose=0)
-            
-            # Update metrics
-            dice_metric.update_state(labels_batch, predictions)
-            iou_metric.update_state(labels_batch, predictions)
-            precision_metric.update_state(labels_batch, predictions > 0.5)
-            recall_metric.update_state(labels_batch, predictions > 0.5)
-            auc_metric.update_state(labels_batch, predictions)
+        # Process batches
+        with torch.no_grad():
+            for batch_features, batch_labels in tqdm(data_loader, desc="Evaluating"):
+                # Move to device
+                batch_features = batch_features.to(self.device)
+                batch_labels = batch_labels.to(self.device)
+                
+                # Predict
+                predictions = self.model(batch_features)
+                
+                # Update metrics
+                dice_metric.update(predictions, batch_labels)
+                iou_metric.update(predictions, batch_labels)
         
         # Compute results
         results = {
-            'dice_coefficient': float(dice_metric.result().numpy()),
-            'iou': float(iou_metric.result().numpy()),
-            'precision': float(precision_metric.result().numpy()),
-            'recall': float(recall_metric.result().numpy()),
-            'auc': float(auc_metric.result().numpy())
+            'dice_coefficient': dice_metric.compute(),
+            'iou': iou_metric.compute()
         }
-        
-        # Compute F1 score
-        if results['precision'] + results['recall'] > 0:
-            results['f1_score'] = (
-                2 * results['precision'] * results['recall'] /
-                (results['precision'] + results['recall'])
-            )
-        else:
-            results['f1_score'] = 0.0
         
         logger.info("Evaluation completed!")
         logger.info("Results:")
@@ -207,21 +191,28 @@ class MiningSegmentationEvaluator:
         Returns:
             Tuple of (features, ground_truth, prediction)
         """
-        # Load tile data
-        features, labels = self.data_loader.load_tile_data(
-            tile_ix,
-            tile_iy,
-            bands=self.network_config.INPUT_BANDS,
-            include_footprint=True
+        # Create a temporary dataset for this single tile
+        temp_dataset = MiningSegmentationDataLoader(
+            config=self.data_config,
+            bands=self.network_config.INPUT_BANDS
         )
         
-        # Replace NaN with 0
-        features = np.nan_to_num(features, nan=0.0)
-        labels = np.nan_to_num(labels, nan=0)
+        # Use the get_tile_by_index method
+        features_tensor, labels_tensor = temp_dataset.get_tile_by_index(tile_ix, tile_iy)
+        
+        # Add batch dimension and move to device
+        features_batch = features_tensor.unsqueeze(0).to(self.device)
         
         # Predict
-        features_batch = features[np.newaxis, ...]
-        prediction = self.model.predict(features_batch, verbose=0)[0]
+        with torch.no_grad():
+            prediction = self.model(features_batch)
+        
+        # Convert to numpy and remove batch dimension
+        prediction = prediction.cpu().squeeze().numpy()
+        
+        # Convert features and labels to numpy (H, W, C) format for visualization
+        features = features_tensor.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
+        labels = labels_tensor.squeeze().numpy()  # (1, H, W) -> (H, W)
         
         return features, labels, prediction
     
@@ -244,38 +235,43 @@ class MiningSegmentationEvaluator:
         """
         logger.info(f"Generating visualizations for {num_samples} samples...")
         
-        # Get tiles
-        tiles = self.data_loader.get_written_tiles(countries, years, cluster_ids)
+        # Create dataset
+        dataset = MiningSegmentationDataLoader(
+            config=self.data_config,
+            countries=countries,
+            years=years,
+            cluster_ids=cluster_ids,
+            bands=self.network_config.INPUT_BANDS
+        )
         
-        if not tiles:
-            raise ValueError("No tiles found")
+        if len(dataset) == 0:
+            raise ValueError("No tiles found with specified filters")
         
         # Randomly sample tiles
-        np.random.shuffle(tiles)
-        sample_tiles = tiles[:num_samples]
+        num_samples = min(num_samples, len(dataset))
+        sample_indices = np.random.choice(len(dataset), num_samples, replace=False)
         
         features_list = []
         labels_list = []
         predictions_list = []
         
-        for tile in sample_tiles:
-            try:
-                features, labels, prediction = self.predict_tile(
-                    tile['tile_ix'],
-                    tile['tile_iy']
-                )
+        with torch.no_grad():
+            for idx in sample_indices:
+                # Get tile from dataset
+                features_tensor, labels_tensor = dataset[idx]
+                
+                # Add batch dimension and predict
+                features_batch = features_tensor.unsqueeze(0).to(self.device)
+                prediction = self.model(features_batch)
+                
+                # Convert to numpy for visualization
+                features = features_tensor.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
+                labels = labels_tensor.squeeze().numpy()  # (1, H, W) -> (H, W)
+                prediction = prediction.cpu().squeeze().numpy()  # -> (H, W)
                 
                 features_list.append(features)
                 labels_list.append(labels)
                 predictions_list.append(prediction)
-                
-            except Exception as e:
-                logger.warning(f"Error processing tile: {e}")
-                continue
-        
-        if not features_list:
-            logger.error("No valid tiles to visualize")
-            return
         
         # Convert to arrays
         features_array = np.array(features_list)
@@ -286,15 +282,15 @@ class MiningSegmentationEvaluator:
         if save_dir:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
-            save_path = save_dir / "predictions_visualization.png"
+            save_path = save_dir / "predictions.png"
         else:
             save_path = None
         
-        # Visualize
+        # Visualize (features in H,W,C format, predictions need channel dim for viz function)
         visualize_predictions(
             features_array,
             labels_array,
-            predictions_array,
+            predictions_array[:, np.newaxis, :, :],  # Add channel dimension
             num_samples=len(features_list),
             save_path=save_path
         )
@@ -326,29 +322,44 @@ class MiningSegmentationEvaluator:
         
         logger.info(f"Exporting predictions to {output_dir}")
         
-        # Get tiles
-        tiles = self.data_loader.get_written_tiles(countries, years, cluster_ids)
+        # Create dataset
+        dataset = MiningSegmentationDataLoader(
+            config=self.data_config,
+            countries=countries,
+            years=years,
+            cluster_ids=cluster_ids,
+            bands=self.network_config.INPUT_BANDS
+        )
         
-        if not tiles:
-            raise ValueError("No tiles found")
+        if len(dataset) == 0:
+            raise ValueError("No tiles found with specified filters")
         
-        logger.info(f"Processing {len(tiles)} tiles...")
+        logger.info(f"Processing {len(dataset)} tiles")
         
-        for tile in tqdm(tiles):
-            try:
-                features, labels, prediction = self.predict_tile(
-                    tile['tile_ix'],
-                    tile['tile_iy'],
-                    threshold=threshold
+        with torch.no_grad():
+            for idx in tqdm(range(len(dataset)), desc="Exporting"):
+                tile = dataset.tiles[idx]
+                
+                # Get prediction
+                features_tensor, labels_tensor = dataset[idx]
+                features_batch = features_tensor.unsqueeze(0).to(self.device)
+                prediction = self.model(features_batch)
+                
+                # Convert to numpy
+                features = features_tensor.permute(1, 2, 0).numpy()
+                labels = labels_tensor.squeeze().numpy()
+                prediction = prediction.cpu().squeeze().numpy()
+                
+                # Save prediction as numpy array
+                output_path = output_dir / f"tile_{tile['tile_ix']}_{tile['tile_iy']}.npz"
+                np.savez_compressed(
+                    output_path,
+                    features=features,
+                    labels=labels,
+                    prediction=prediction,
+                    tile_ix=tile['tile_ix'],
+                    tile_iy=tile['tile_iy']
                 )
-                
-                # Save prediction
-                filename = f"tile_{tile['tile_ix']}_{tile['tile_iy']}_pred.npy"
-                np.save(output_dir / filename, prediction)
-                
-            except Exception as e:
-                logger.warning(f"Error processing tile {tile['tile_ix']}, {tile['tile_iy']}: {e}")
-                continue
         
         logger.info("Export completed!")
 

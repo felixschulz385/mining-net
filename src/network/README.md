@@ -1,6 +1,6 @@
 # Mining Segmentation Network
 
-Comprehensive UNet architecture for semantic segmentation of mining areas from multi-spectral Landsat imagery.
+Comprehensive UNet architecture for semantic segmentation of mining areas from multi-spectral Landsat imagery, implemented in **PyTorch**.
 
 ## Architecture
 
@@ -15,9 +15,10 @@ The network uses a standard UNet architecture with:
 
 - **Multiple Loss Functions**: Binary cross-entropy, Dice loss, Focal loss, or combined
 - **Data Augmentation**: Random flips, rotations, brightness, and contrast adjustments
-- **Comprehensive Metrics**: Dice coefficient, IoU, precision, recall, F1-score, AUC
-- **Mixed Precision Training**: Optional for faster training on compatible GPUs
-- **Callbacks**: Early stopping, learning rate reduction, checkpointing, TensorBoard logging
+- **Comprehensive Metrics**: Dice coefficient, IoU
+- **GPU Support**: CUDA, MPS (Apple Silicon), and CPU
+- **TensorBoard Logging**: Track training progress with TensorBoard
+- **Checkpointing**: Save best model and training history
 
 ## Files
 
@@ -58,7 +59,7 @@ python src/network/evaluate.py path/to/checkpoint.h5 \
 
 Export predictions:
 ```bash
-python src/network/evaluate.py path/to/checkpoint.h5 \
+python src/network/evaluate.py path/to/checkpoint.pth \
     --export \
     --output-dir predictions/
 ```
@@ -74,6 +75,7 @@ config = NetworkConfig()
 config.EPOCHS = 50
 config.BATCH_SIZE = 32
 config.LEARNING_RATE = 1e-4
+config.DEVICE = 'cuda'  # or 'cpu' or 'mps'
 
 # Initialize trainer
 trainer = MiningSegmentationTrainer(network_config=config)
@@ -92,7 +94,7 @@ history = trainer.train(
 from network.evaluate import MiningSegmentationEvaluator
 
 # Load model
-evaluator = MiningSegmentationEvaluator('path/to/checkpoint.h5')
+evaluator = MiningSegmentationEvaluator('path/to/checkpoint.pth')
 
 # Predict on a single tile
 features, ground_truth, prediction = evaluator.predict_tile(
@@ -106,13 +108,43 @@ print(f"Dice: {results['dice_coefficient']:.4f}")
 print(f"IoU: {results['iou']:.4f}")
 ```
 
+### Using the PyTorch Dataset
+
+```python
+from data.data_loader import MiningSegmentationDataLoader
+from torch.utils.data import DataLoader
+
+# Create dataset (lazy-loading from Zarr)
+dataset = MiningSegmentationDataLoader(
+    countries=['ZAF'],
+    years=[2020],
+    bands=['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
+)
+
+# Create PyTorch DataLoader
+loader = DataLoader(
+    dataset,
+    batch_size=32,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True
+)
+
+# Iterate through batches
+for features, labels in loader:
+    # features: (batch_size, 7, 64, 64)
+    # labels: (batch_size, 1, 64, 64)
+    print(features.shape, labels.shape)
+```
+
 ## Configuration
 
-Key configuration options in [config.py](src/network/config.py):
+Key configuration options in [config.py](config.py):
 
 ```python
 # Model architecture
-INPUT_SHAPE = (64, 64, 7)
+IN_CHANNELS = 7
+INPUT_SIZE = 64
 FILTERS_BASE = 64
 DEPTH = 4
 DROPOUT_RATE = 0.1
@@ -121,6 +153,12 @@ DROPOUT_RATE = 0.1
 BATCH_SIZE = 32
 EPOCHS = 100
 LEARNING_RATE = 1e-4
+LEARNING_RATE_DECAY = 0.95
+
+# Device
+DEVICE = 'cuda'  # 'cuda', 'cpu', or 'mps'
+NUM_WORKERS = 4
+PIN_MEMORY = True
 
 # Loss function
 LOSS_TYPE = 'combined'  # 'bce', 'dice', 'focal', 'combined'
@@ -136,14 +174,10 @@ ROTATE_90 = True
 
 ## Model Performance
 
-The model uses several metrics to evaluate performance:
+The model uses the following metrics to evaluate performance:
 
 - **Dice Coefficient**: Measures overlap between prediction and ground truth (0-1, higher is better)
 - **IoU (Jaccard Index)**: Intersection over union metric (0-1, higher is better)
-- **Precision**: Proportion of predicted mining pixels that are correct
-- **Recall**: Proportion of actual mining pixels that are detected
-- **F1-Score**: Harmonic mean of precision and recall
-- **AUC**: Area under ROC curve
 
 ## Data Requirements
 
@@ -151,47 +185,68 @@ The network expects data from [MiningSegmentationDataLoader](../data/data_loader
 - 64×64 pixel tiles at ~30m resolution
 - 7 Landsat bands: blue, green, red, nir, swir1, swir2, thermal
 - Binary mining footprint labels (0 = non-mining, 1 = mining)
+- Data format: PyTorch tensors with shape (batch, channels, height, width)
+- **Lazy Loading**: Tiles are loaded on-demand from Zarr, not preloaded into memory
 
 ## Advanced Features
 
-### Class Weighting
+### Device Configuration
 
-For imbalanced datasets (few mining pixels), enable class weighting:
+The model supports multiple device types:
 ```python
-config.USE_CLASS_WEIGHTS = True
-config.POSITIVE_CLASS_WEIGHT = 10.0  # Increase weight for mining class
+config.DEVICE = 'cuda'  # NVIDIA GPU
+config.DEVICE = 'mps'   # Apple Silicon GPU
+config.DEVICE = 'cpu'   # CPU only
 ```
 
-### Mixed Precision Training
+### Data Loading
 
-For faster training on GPUs with Tensor Cores (e.g., V100, A100):
-```python
-config.USE_MIXED_PRECISION = True
-```
+The PyTorch Dataset implementation uses lazy loading:
+- Tiles are only loaded when accessed during training
+- Minimal memory footprint - only current batch in memory
+- Efficient for large datasets
+- Multi-worker support for parallel loading
 
 ### Custom Loss Functions
 
-Modify the loss function in [utils.py](src/network/utils.py) or select in config:
+Modify the loss function in [utils.py](utils.py) or select in config:
 - `bce`: Binary cross-entropy
 - `dice`: Dice loss (good for imbalanced data)
 - `focal`: Focal loss (emphasizes hard examples)
 - `combined`: Weighted combination of BCE and Dice
 
+### Multi-GPU Training
+
+For multi-GPU training, wrap the model with `DataParallel` or `DistributedDataParallel`:
+```python
+import torch.nn as nn
+model = nn.DataParallel(model)
+```
+
 ## Output
 
 Training outputs:
-- **Checkpoints**: Saved in `models/checkpoints/`
-- **TensorBoard logs**: Saved in `logs/`
-- **Training history**: CSV and plots in checkpoint directory
+- **Checkpoints**: Saved in `models/checkpoints/<run_name>/`
+  - `best_model.pth`: Best model based on validation loss
+  - `epoch_XXX.pth`: Checkpoint at each epoch
+- **TensorBoard logs**: Saved in `logs/<run_name>/`
+- **Training history**: Plots saved in checkpoint directory
 
 ## Requirements
 
-- TensorFlow >= 2.10
+- **PyTorch** >= 2.0
+- torch
+- torchvision (optional)
 - numpy
 - xarray
 - zarr
 - matplotlib
 - tqdm
+- tensorboard
+- zarr
+- matplotlib
+- tqdm
+- tensorboard
 
 ## License
 
