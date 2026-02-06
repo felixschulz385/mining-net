@@ -76,6 +76,10 @@ class NetworkConfig:
     NUM_WORKERS = 4  # DataLoader workers
     PIN_MEMORY = True  # Pin memory for faster GPU transfer
     
+    # torch.compile optimization (PyTorch 2.0+)
+    USE_COMPILE = True  # Enable torch.compile for faster training
+    COMPILE_MODE = 'default'  # 'default', 'reduce-overhead', 'max-autotune'
+    
     @classmethod
     def create_directories(cls):
         """Create necessary directories for training."""

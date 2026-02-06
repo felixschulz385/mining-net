@@ -93,6 +93,18 @@ class MiningSegmentationTrainer:
         # Move model to device
         self.model = self.model.to(self.device)
         
+        # Optionally compile model (PyTorch 2.0+)
+        if self.network_config.USE_COMPILE:
+            try:
+                logger.info(f"Compiling model with mode='{self.network_config.COMPILE_MODE}'...")
+                self.model = torch.compile(
+                    self.model,
+                    mode=self.network_config.COMPILE_MODE
+                )
+                logger.info("Model compiled successfully")
+            except Exception as e:
+                logger.warning(f"Failed to compile model: {e}. Continuing without compilation.")
+        
         # Setup optimizer
         self.optimizer = optim.Adam(
             self.model.parameters(),
