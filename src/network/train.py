@@ -16,6 +16,14 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 
+# Import AMP with version compatibility
+try:
+    from torch.amp import autocast, GradScaler
+    AMP_NEW_API = True
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
+    AMP_NEW_API = False
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -76,6 +84,7 @@ class MiningSegmentationTrainer:
         self.model = None
         self.optimizer = None
         self.scheduler = None
+        self.scaler = None  # For mixed precision training
     
     def setup_model(self):
         """Build and setup the model."""
@@ -120,6 +129,16 @@ class MiningSegmentationTrainer:
             min_lr=self.network_config.MIN_LR
         )
         
+        # Setup mixed precision scaler if using AMP
+        if self.network_config.USE_AMP and self.device.type == 'cuda':
+            if AMP_NEW_API:
+                self.scaler = GradScaler('cuda')
+            else:
+                self.scaler = GradScaler()
+            logger.info(f"Mixed precision training enabled with {self.network_config.AMP_DTYPE}")
+        else:
+            self.scaler = None
+        
         # Count parameters
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -127,9 +146,10 @@ class MiningSegmentationTrainer:
         logger.info(f"Trainable parameters: {trainable_params:,}")
     
     def get_loss_function(self):
-        """Get loss function based on configuration."""
+        """Get loss function based on configuration (autocast-safe)."""
         if self.network_config.LOSS_TYPE == 'bce':
-            return nn.BCELoss()
+            # Use BCEWithLogitsLoss for autocast safety (applies sigmoid internally)
+            return nn.BCEWithLogitsLoss()
         elif self.network_config.LOSS_TYPE == 'dice':
             return dice_loss
         elif self.network_config.LOSS_TYPE == 'focal':
@@ -172,7 +192,6 @@ class MiningSegmentationTrainer:
             countries=countries,
             years=years,
             cluster_ids=cluster_ids,
-            bands=self.network_config.INPUT_BANDS,
             normalize=self.network_config.NORMALIZE_INPUTS,
             band_means=self.network_config.BAND_MEANS,
             band_stds=self.network_config.BAND_STDS,
@@ -202,7 +221,9 @@ class MiningSegmentationTrainer:
             batch_size=self.network_config.BATCH_SIZE,
             shuffle=True,
             num_workers=self.network_config.NUM_WORKERS,
-            pin_memory=self.network_config.PIN_MEMORY
+            pin_memory=self.network_config.PIN_MEMORY,
+            prefetch_factor=self.network_config.PREFETCH_FACTOR if self.network_config.NUM_WORKERS > 0 else None,
+            persistent_workers=self.network_config.PERSISTENT_WORKERS if self.network_config.NUM_WORKERS > 0 else False
         )
         
         val_loader = DataLoader(
@@ -210,7 +231,9 @@ class MiningSegmentationTrainer:
             batch_size=self.network_config.BATCH_SIZE,
             shuffle=False,
             num_workers=self.network_config.NUM_WORKERS,
-            pin_memory=self.network_config.PIN_MEMORY
+            pin_memory=self.network_config.PIN_MEMORY,
+            prefetch_factor=self.network_config.PREFETCH_FACTOR if self.network_config.NUM_WORKERS > 0 else None,
+            persistent_workers=self.network_config.PERSISTENT_WORKERS if self.network_config.NUM_WORKERS > 0 else False
         )
         
         return train_loader, val_loader
@@ -234,37 +257,71 @@ class MiningSegmentationTrainer:
         total_grad_norm = 0.0
         num_batches = 0
         
+        # Determine dtype for autocast
+        autocast_dtype = torch.bfloat16 if self.network_config.AMP_DTYPE == 'bfloat16' else torch.float16
+        
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
-        for features, labels in pbar:
+        for batch_idx, (features, labels) in enumerate(pbar):
             # Move to device
             features = features.to(self.device)
             labels = labels.to(self.device)
             
-            # Forward pass
-            self.optimizer.zero_grad()
-            predictions = self.model(features)
-            loss = loss_fn(predictions, labels)
+            # Forward pass with mixed precision (version compatible)
+            if self.scaler is not None:
+                if AMP_NEW_API:
+                    with autocast(device_type=self.device.type, dtype=autocast_dtype):
+                        predictions = self.model(features)
+                        loss = loss_fn(predictions, labels)
+                        loss = loss / self.network_config.GRADIENT_ACCUMULATION_STEPS
+                else:
+                    with autocast():
+                        predictions = self.model(features)
+                        loss = loss_fn(predictions, labels)
+                        loss = loss / self.network_config.GRADIENT_ACCUMULATION_STEPS
+            else:
+                predictions = self.model(features)
+                loss = loss_fn(predictions, labels)
+                loss = loss / self.network_config.GRADIENT_ACCUMULATION_STEPS
             
             # Backward pass
-            loss.backward()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
             
-            # Compute gradient norm before clipping (for monitoring)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.network_config.GRADIENT_CLIP_VALUE if hasattr(self.network_config, 'GRADIENT_CLIP_VALUE') else float('inf')
-            )
-            total_grad_norm += grad_norm.item()
-            num_batches += 1
+            # Only step optimizer every N accumulation steps
+            if (batch_idx + 1) % self.network_config.GRADIENT_ACCUMULATION_STEPS == 0:
+                # Compute gradient norm before clipping (for monitoring)
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.network_config.GRADIENT_CLIP_VALUE
+                )
+                total_grad_norm += grad_norm.item()
+                num_batches += 1
+                
+                # Optimizer step
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad()
             
-            self.optimizer.step()
-            
-            # Update metrics
-            epoch_loss += loss.item()
+            # Update metrics (scale loss back for logging)
+            epoch_loss += loss.item() * self.network_config.GRADIENT_ACCUMULATION_STEPS
             dice_metric.update(predictions.detach(), labels)
             iou_metric.update(predictions.detach(), labels)
             
+            # Clear CUDA cache periodically
+            if self.device.type == 'cuda' and (batch_idx + 1) % self.network_config.EMPTY_CACHE_EVERY_N_STEPS == 0:
+                torch.cuda.empty_cache()
+            
             # Update progress bar
-            pbar.set_postfix({'loss': loss.item()})
+            pbar.set_postfix({'loss': loss.item() * self.network_config.GRADIENT_ACCUMULATION_STEPS})
         
         metrics = {
             'loss': epoch_loss / len(train_loader),
@@ -291,15 +348,28 @@ class MiningSegmentationTrainer:
         dice_metric = DiceCoefficient()
         iou_metric = IoU()
         
+        # Determine dtype for autocast
+        autocast_dtype = torch.bfloat16 if self.network_config.AMP_DTYPE == 'bfloat16' else torch.float16
+        
         with torch.no_grad():
             for features, labels in tqdm(val_loader, desc="Validating"):
                 # Move to device
                 features = features.to(self.device)
                 labels = labels.to(self.device)
                 
-                # Forward pass
-                predictions = self.model(features)
-                loss = loss_fn(predictions, labels)
+                # Forward pass with mixed precision (version compatible)
+                if self.scaler is not None:
+                    if AMP_NEW_API:
+                        with autocast(device_type=self.device.type, dtype=autocast_dtype):
+                            predictions = self.model(features)
+                            loss = loss_fn(predictions, labels)
+                    else:
+                        with autocast():
+                            predictions = self.model(features)
+                            loss = loss_fn(predictions, labels)
+                else:
+                    predictions = self.model(features)
+                    loss = loss_fn(predictions, labels)
                 
                 # Update metrics
                 val_loss += loss.item()

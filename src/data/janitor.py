@@ -9,15 +9,11 @@ state matches the actual filesystem state. It can run in two modes:
 Workflow:
 ---------
 1. Database Integrity Checks:
-   - For UPLOADED tasks: Verify clusters exist on HPC
-     * Check cluster/year directories exist on HPC via SSH
-     * If not on HPC: downgrade to REPROJECTED (if in MMAP) -> DOWNLOADED -> PENDING
-   
-   - For REPROJECTED tasks: Verify MMAP directories exist and are complete
+   - For STORED tasks: Verify Zarr directories exist and are complete
      * Check cluster/year directories exist
      * Compare actual tile coordinates with tiles table in database
-     * Verify each tile has features.pt, labels.pt, metadata.json
-     * If mismatch: remove MMAP in CLEAN mode, downgrade to DOWNLOADED or PENDING
+     * Verify each tile has features.zarr, labels.zarr, metadata.json
+     * If mismatch: remove Zarr in CLEAN mode, downgrade to DOWNLOADED or PENDING
    
    - For DOWNLOADED tasks: Verify local files exist in download directory
      * If file missing: check if on Google Drive -> downgrade to COMPLETED
@@ -27,14 +23,14 @@ Workflow:
      * If not found: reset to PENDING for re-export
 
 2. Orphan Detection:
-   - MMAP Orphans: Find cluster/year directories not in database
+   - Zarr Orphans: Find cluster/year directories not in database
      * Remove in CLEAN mode
    
    - Download Orphans: Find local .tif files not referenced in database
      * Remove in CLEAN mode
 
 3. Tile Integrity:
-   - Compare MMAP tile subdirectories with tiles table entries
+   - Compare Zarr tile subdirectories with tiles table entries
    - Verify tile coordinates match exactly (tile_ix, tile_iy)
    - Check for missing or extra tiles
    - Remove incomplete tile directories in CLEAN mode
@@ -46,6 +42,7 @@ disk space waste from orphaned files.
 import time
 import logging
 import pickle
+import json
 import subprocess
 from pathlib import Path
 from typing import Optional, List, Set, Tuple, Dict
@@ -205,19 +202,45 @@ class JanitorWorker:
         logger.info(f"Found {len(downloaded)} files in download directory")
         return downloaded
     
-    def _get_mmap_clusters(self) -> Dict[int, Set[int]]:
-        """Get clusters and years in MMAP directory.
+    def _get_zarr_clusters(self) -> Dict[int, Set[int]]:
+        """Get clusters and years in Zarr directory.
         
         Returns:
             Dict mapping cluster_id -> set of years
         """
-        mmap_path = self.config.DATA_DIR / "landsat_mmap"
+        zarr_path = self.config.DATA_DIR / "landsat_zarr"
         clusters = defaultdict(set)
         
-        if not mmap_path.exists():
+        # Try to read from global Zarr index arrays (new format)
+        try:
+            import zarr
+            store_path = zarr_path / "data.zarr"
+            if store_path.exists():
+                zarr_group = zarr.open_group(store=str(store_path), mode='r')
+                
+                # Check if index arrays exist
+                if 'cluster_ids' in zarr_group and 'years' in zarr_group:
+                    cluster_ids_array = zarr_group['cluster_ids'][:]
+                    years_array = zarr_group['years'][:]
+                    
+                    # Build clusters dict from index arrays
+                    for idx in range(len(cluster_ids_array)):
+                        cluster_id = int(cluster_ids_array[idx])
+                        year = int(years_array[idx])
+                        clusters[cluster_id].add(year)
+                    
+                    if clusters:
+                        total_entries = sum(len(years) for years in clusters.values())
+                        logger.info(f"Found {len(clusters)} clusters with {total_entries} year entries in Zarr (from index arrays)")
+                        return clusters
+        except Exception as e:
+            logger.debug(f"Could not read Zarr index arrays: {e}")
+        
+        # Fallback: scan directory structure (old format or incomplete global Zarr)
+        if not zarr_path.exists():
             return clusters
         
-        for cluster_dir in mmap_path.iterdir():
+        for cluster_dir in zarr_path.iterdir():
             if cluster_dir.is_dir():
                 try:
                     cluster_id = int(cluster_dir.name)
@@ -234,11 +257,11 @@ class JanitorWorker:
                     pass
         
         total_entries = sum(len(years) for years in clusters.values())
-        logger.info(f"Found {len(clusters)} clusters with {total_entries} year entries in MMAP")
+        logger.info(f"Found {len(clusters)} clusters with {total_entries} year entries in Zarr (from directory scan)")
         return clusters
     
-    def _count_tiles_in_mmap(self, cluster_id: int, year: int) -> int:
-        """Count number of tile directories in MMAP for a cluster/year.
+    def _count_tiles_in_zarr(self, cluster_id: int, year: int) -> int:
+        """Count number of tile directories in Zarr for a cluster/year.
         
         Args:
             cluster_id: Cluster ID
@@ -247,37 +270,35 @@ class JanitorWorker:
         Returns:
             Number of tile directories found
         """
-        mmap_path = self.config.DATA_DIR / "landsat_mmap" / str(cluster_id) / str(year)
-        """Count number of tile directories in MMAP for a cluster/year.
+        zarr_path = self.config.DATA_DIR / "landsat_zarr" / str(cluster_id) / str(year)
         
-        Args:
-            cluster_id: Cluster ID
-            year: Year
-            
-        Returns:
-            Number of tile directories found
-        """
-        mmap_path = self.config.DATA_DIR / "landsat_mmap" / str(cluster_id) / str(year)
-        
-        if not mmap_path.exists():
+        if not zarr_path.exists():
             return 0
         
         # Count directories that match tile naming pattern (ix_iy)
         tile_count = 0
-        for tile_dir in mmap_path.iterdir():
+        for tile_dir in zarr_path.iterdir():
             if tile_dir.is_dir() and '_' in tile_dir.name:
-                # Verify it has required files
-                has_features = (tile_dir / "features.pt").exists()
-                has_labels = (tile_dir / "labels.pt").exists()
-                has_metadata = (tile_dir / "metadata.json").exists()
-                
-                if has_features and has_labels and has_metadata:
-                    tile_count += 1
+                try:
+                    parts = tile_dir.name.split('_')
+                    if len(parts) == 2:
+                        int(parts[0])  # tile_ix
+                        int(parts[1])  # tile_iy
+                        
+                        # Verify it has required Zarr files
+                        has_features = (tile_dir / "features.zarr").exists()
+                        has_labels = (tile_dir / "labels.zarr").exists()
+                        has_metadata = (tile_dir / "metadata.json").exists()
+                        
+                        if has_features and has_labels and has_metadata:
+                            tile_count += 1
+                except ValueError:
+                    continue
         
         return tile_count
     
-    def _get_mmap_tile_coords(self, cluster_id: int, year: int) -> Set[Tuple[int, int]]:
-        """Get actual tile coordinates in MMAP directory.
+    def _get_zarr_tile_coords(self, cluster_id: int, year: int) -> Set[Tuple[int, int]]:
+        """Get actual tile coordinates in Zarr directory or from index arrays.
         
         Args:
             cluster_id: Cluster ID
@@ -286,13 +307,39 @@ class JanitorWorker:
         Returns:
             Set of (tile_ix, tile_iy) tuples
         """
-        mmap_path = self.config.DATA_DIR / "landsat_mmap" / str(cluster_id) / str(year)
         tiles = set()
         
-        if not mmap_path.exists():
+        # Try to get from global Zarr index arrays (new format)
+        try:
+            import zarr
+            store_path = self.config.DATA_DIR / "landsat_zarr" / "data.zarr"
+            if store_path.exists():
+                zarr_group = zarr.open_group(store=str(store_path), mode='r')
+                
+                # Check if index arrays exist
+                if 'cluster_ids' in zarr_group and 'tile_ix' in zarr_group and 'tile_iy' in zarr_group:
+                    cluster_ids_array = zarr_group['cluster_ids'][:]
+                    tile_ix_array = zarr_group['tile_ix'][:]
+                    tile_iy_array = zarr_group['tile_iy'][:]
+                    years_array = zarr_group['years'][:]
+                    
+                    # Find all tiles for this cluster/year
+                    for idx in range(len(cluster_ids_array)):
+                        if cluster_ids_array[idx] == cluster_id and years_array[idx] == year:
+                            tiles.add((int(tile_ix_array[idx]), int(tile_iy_array[idx])))
+                    
+                    if tiles:
+                        return tiles
+        except Exception as e:
+            logger.debug(f"Could not read Zarr index arrays: {e}")
+        
+        # Fallback: scan directory structure (old format or incomplete global Zarr)
+        zarr_path = self.config.DATA_DIR / "landsat_zarr" / str(cluster_id) / str(year)
+        
+        if not zarr_path.exists():
             return tiles
         
-        for tile_dir in mmap_path.iterdir():
+        for tile_dir in zarr_path.iterdir():
             if tile_dir.is_dir() and '_' in tile_dir.name:
                 try:
                     parts = tile_dir.name.split('_')
@@ -314,11 +361,11 @@ class JanitorWorker:
         # Get filesystem state
         drive_files = self._get_drive_files()
         downloaded_files = self._get_downloaded_files()
-        mmap_clusters = self._get_mmap_clusters()
+        zarr_clusters = self._get_zarr_clusters()
         
-        # Check each status level (skip UPLOADED - no remote checking)
+        # Check each status level
         statuses_to_check = [
-            self.config.STATUS_REPROJECTED,
+            self.config.STATUS_STORED,
             self.config.STATUS_DOWNLOADED,
             self.config.STATUS_COMPLETED
         ]
@@ -341,13 +388,13 @@ class JanitorWorker:
                 issue = None
                 new_status = None
                 
-                if status == self.config.STATUS_REPROJECTED:
-                    # Check MMAP exists and has correct tiles matching database
+                if status == self.config.STATUS_STORED:
+                    # Check Zarr exists and has correct tiles matching database
                     if cluster_id is None:
                         issue = "No cluster_id"
                         new_status = self.config.STATUS_PENDING
-                    elif cluster_id not in mmap_clusters or year not in mmap_clusters[cluster_id]:
-                        issue = "MMAP cluster/year missing"
+                    elif cluster_id not in zarr_clusters or year not in zarr_clusters[cluster_id]:
+                        issue = "Zarr cluster/year missing"
                         # Check if we can downgrade to downloaded
                         if task.get('local_filepath') and Path(task['local_filepath']).exists():
                             new_status = self.config.STATUS_DOWNLOADED
@@ -358,14 +405,14 @@ class JanitorWorker:
                         db_tiles = self.db.get_tiles_for_task(geometry_hash, year)
                         expected_coords = {(t['tile_ix'], t['tile_iy']) for t in db_tiles}
                         
-                        # Get actual tiles from MMAP
-                        actual_coords = self._get_mmap_tile_coords(cluster_id, year)
+                        # Get actual tiles from Zarr
+                        actual_coords = self._get_zarr_tile_coords(cluster_id, year)
                         
                         if not expected_coords:
                             issue = "No tiles in database"
                             new_status = self.config.STATUS_PENDING
                         elif not actual_coords:
-                            issue = "No tiles in MMAP directory"
+                            issue = "No tiles in Zarr directory"
                             new_status = self.config.STATUS_DOWNLOADED if task.get('local_filepath') else self.config.STATUS_PENDING
                         elif actual_coords != expected_coords:
                             missing = expected_coords - actual_coords
@@ -445,12 +492,12 @@ class JanitorWorker:
             if self.clean:
                 for issue_data in status_info['issues']:
                     if issue_data['new_status']:
-                        # Remove incomplete MMAP if needed for REPROJECTED issues
-                        if status == self.config.STATUS_REPROJECTED and 'mismatch' in issue_data['issue'].lower():
-                            mmap_dir = self.config.DATA_DIR / "landsat_mmap" / str(issue_data['cluster_id']) / str(issue_data['year'])
-                            if mmap_dir.exists():
+                        # Remove incomplete Zarr if needed for STORED issues
+                        if status == self.config.STATUS_STORED and 'mismatch' in issue_data['issue'].lower():
+                            zarr_dir = self.config.DATA_DIR / "landsat_zarr" / str(issue_data['cluster_id']) / str(issue_data['year'])
+                            if zarr_dir.exists():
                                 import shutil
-                                shutil.rmtree(mmap_dir)
+                                shutil.rmtree(zarr_dir)
                         
                         self.db.update_task_status(
                             issue_data['geometry_hash'], 
@@ -463,15 +510,69 @@ class JanitorWorker:
         logger.info(f"\nSummary: {issues_found} issues found, {issues_fixed} fixed")
         return issues_found, issues_fixed
     
-    def check_orphaned_mmap(self):
-        """Check for MMAP directories not in database."""
+    def _save_metadata(self):
+        """Save metadata to disk."""
+        with open(self.metadata_path, 'w') as f:
+            json.dump(self.store_metadata, f, indent=2)
+    
+    def check_zarr_index_integrity(self) -> bool:
+        """Verify that Zarr group has all required index arrays.
+        
+        Returns:
+            True if index arrays are valid, False otherwise
+        """
+        try:
+            import zarr
+            store_path = self.config.DATA_DIR / "landsat_zarr" / "data.zarr"
+            
+            if not store_path.exists():
+                logger.debug("No Zarr store found")
+                return True  # No store yet, not an error
+            
+            zarr_group = zarr.open_group(store=str(store_path), mode='r')
+            
+            # Check for required arrays
+            required_arrays = ['features', 'labels', 'cluster_ids', 'tile_ix', 'tile_iy', 'years']
+            missing = []
+            for array_name in required_arrays:
+                if array_name not in zarr_group:
+                    missing.append(array_name)
+            
+            if missing:
+                logger.warning(f"Zarr store missing index arrays: {missing}")
+                return False
+            
+            # Verify array sizes match
+            n_features = zarr_group['features'].shape[0]
+            n_labels = zarr_group['labels'].shape[0]
+            n_cluster_ids = len(zarr_group['cluster_ids'])
+            n_tile_ix = len(zarr_group['tile_ix'])
+            n_tile_iy = len(zarr_group['tile_iy'])
+            n_years = len(zarr_group['years'])
+            
+            if not (n_features == n_labels == n_cluster_ids == n_tile_ix == n_tile_iy == n_years):
+                logger.warning(
+                    f"Zarr array size mismatch: features={n_features}, labels={n_labels}, "
+                    f"cluster_ids={n_cluster_ids}, tile_ix={n_tile_ix}, tile_iy={n_tile_iy}, years={n_years}"
+                )
+                return False
+            
+            logger.debug(f"Zarr store has all required arrays ({n_features} tiles)")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error checking Zarr index integrity: {e}")
+            return False
+    
+    def check_orphaned_zarr(self):
+        """Check for Zarr directories not in database."""
         orphans_found = 0
         orphans_removed = 0
         orphan_list = []
         
-        mmap_path = self.config.DATA_DIR / "landsat_mmap"
+        zarr_path = self.config.DATA_DIR / "landsat_zarr"
         
-        if not mmap_path.exists():
+        if not zarr_path.exists():
             return 0, 0
         
         # Get all tasks with cluster IDs from database
@@ -484,9 +585,9 @@ class JanitorWorker:
             """)
             db_clusters = {(row['cluster_id'], row['year']) for row in cursor.fetchall()}
         
-        # Check each MMAP cluster directory
-        for cluster_dir in mmap_path.iterdir():
-            if not cluster_dir.is_dir():
+        # Check each Zarr cluster directory (skip global data.zarr)
+        for cluster_dir in zarr_path.iterdir():
+            if not cluster_dir.is_dir() or cluster_dir.name == "data.zarr":
                 continue
             
             try:
@@ -511,7 +612,7 @@ class JanitorWorker:
         
         # Report and clean
         if orphan_list:
-            logger.info(f"\n=== Orphaned MMAP Files ===")
+            logger.info(f"\n=== Orphaned Zarr Directories ===")
             logger.info(f"Found {len(orphan_list)} orphaned cluster/year directories")
             
             for cluster_id, year, year_dir in orphan_list:
@@ -524,8 +625,8 @@ class JanitorWorker:
             
             # Remove empty cluster directories
             if self.clean:
-                for cluster_dir in mmap_path.iterdir():
-                    if cluster_dir.is_dir():
+                for cluster_dir in zarr_path.iterdir():
+                    if cluster_dir.is_dir() and cluster_dir.name != "data.zarr":
                         try:
                             if not any(cluster_dir.iterdir()):
                                 cluster_dir.rmdir()
@@ -581,11 +682,15 @@ class JanitorWorker:
         """
         results = {}
         
+        # Check Zarr index array integrity
+        if not self.check_zarr_index_integrity():
+            logger.warning("Zarr index arrays are incomplete - some checks will use directory scanning")
+        
         # Check database integrity (checks against filesystem)
         results['database'] = self.check_database_integrity()
         
-        # Check for orphaned MMAP directories
-        results['mmap_orphans'] = self.check_orphaned_mmap()
+        # Check for orphaned Zarr directories
+        results['zarr_orphans'] = self.check_orphaned_zarr()
         
         # Check for orphaned downloads
         results['download_orphans'] = self.check_orphaned_downloads()
@@ -615,7 +720,7 @@ class JanitorWorker:
                     f"Total issues found: {total_issues}\n"
                     f"Total issues fixed: {total_fixed}\n"
                     f"  Database integrity: {results['database'][0]} found, {results['database'][1]} fixed\n"
-                    f"  MMAP orphans: {results['mmap_orphans'][0]} found, {results['mmap_orphans'][1]} removed\n"
+                    f"  Zarr orphans: {results['zarr_orphans'][0]} found, {results['zarr_orphans'][1]} removed\n"
                     f"  Download orphans: {results['download_orphans'][0]} found, {results['download_orphans'][1]} removed"
                 )
                 

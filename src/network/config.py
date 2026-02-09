@@ -13,13 +13,13 @@ from config import Config
 class NetworkConfig:
     """Configuration for network training."""
     
-    # Model architecture
+    # Model architecture (optimized for A100 40GB)
     IN_CHANNELS = 7  # Number of input channels (Landsat bands)
     INPUT_SIZE = 64  # Height and width of input tiles
     NUM_CLASSES = 1  # Binary segmentation
-    FILTERS_BASE = 64  # Base number of filters in UNet
-    DEPTH = 4  # Number of pooling operations
-    DROPOUT_RATE = 0.1
+    FILTERS_BASE = 128  # Base number of filters in UNet (increased from 64 for A100)
+    DEPTH = 5  # Number of pooling operations (increased from 4 for deeper model)
+    DROPOUT_RATE = 0.2  # Increased dropout for larger model
     
     # Input bands
     INPUT_BANDS = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
@@ -33,7 +33,7 @@ class NetworkConfig:
     BAND_STDS = None   # Will be computed if None
     
     # Training parameters
-    BATCH_SIZE = 32
+    BATCH_SIZE = 64  # Increased from 32 for A100 40GB with AMP
     EPOCHS = 100
     LEARNING_RATE = 1e-3  # Increased for better initial convergence
     LEARNING_RATE_DECAY = 0.95  # Exponential decay rate
@@ -41,6 +41,14 @@ class NetworkConfig:
     
     # Gradient clipping (prevents explosion)
     GRADIENT_CLIP_VALUE = 1.0  # Clip gradients to this max norm
+    
+    # Mixed precision training (critical for A100 performance)
+    USE_AMP = True  # Automatic Mixed Precision (float16/bfloat16)
+    AMP_DTYPE = 'bfloat16'  # 'float16' or 'bfloat16' (bfloat16 recommended for A100)
+    
+    # Gradient accumulation (for effective larger batch sizes)
+    GRADIENT_ACCUMULATION_STEPS = 1  # Accumulate gradients over N steps
+    # Effective batch size = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
     
     # Data augmentation
     USE_AUGMENTATION = True
@@ -78,12 +86,17 @@ class NetworkConfig:
     LOG_DIR = Config.LOGS_DIR
     
     # Device configuration
-    DEVICE = 'cuda'  # 'cuda', 'cpu', or 'mps' (for Apple Silicon)
-    NUM_WORKERS = 4  # DataLoader workers
+    DEVICE = 'cuda'  # 'cuda', 'cpu', or 'mps' (for Apple Silicon) - auto-detected in trainer
+    NUM_WORKERS = 4  # DataLoader workers (set to 4 based on system recommendation)
     PIN_MEMORY = True  # Pin memory for faster GPU transfer
+    PREFETCH_FACTOR = 2  # Number of batches to prefetch per worker
+    PERSISTENT_WORKERS = True  # Keep workers alive between epochs (faster for large datasets)
+    
+    # Memory optimization
+    EMPTY_CACHE_EVERY_N_STEPS = 100  # Clear CUDA cache periodically to prevent fragmentation
     
     # torch.compile optimization (PyTorch 2.0+)
-    USE_COMPILE = True  # Enable torch.compile for faster training
+    USE_COMPILE = False  # Enable torch.compile for faster training
     COMPILE_MODE = 'default'  # 'default', 'reduce-overhead', 'max-autotune'
     
     @classmethod

@@ -56,10 +56,13 @@ class Config:
     STATUS_SUBMITTED = "submitted"
     STATUS_COMPLETED = "completed"
     STATUS_DOWNLOADED = "downloaded"
-    STATUS_REPROJECTED = "reprojected"
-    STATUS_COMPRESSED = "compressed"
-    STATUS_UPLOADED = "uploaded"
+    STATUS_STORED = "stored"  # Stored in Zarr format
     STATUS_FAILED = "failed"
+    
+    # Legacy statuses (deprecated, kept for backward compatibility)
+    STATUS_REPROJECTED = "reprojected"  # Old MMAP format (deprecated)
+    STATUS_COMPRESSED = "compressed"  # Deprecated
+    STATUS_UPLOADED = "uploaded"  # Deprecated
     
     @classmethod
     def ensure_dirs(cls):

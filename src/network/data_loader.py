@@ -1,5 +1,6 @@
-"""PyTorch data provider for mining segmentation tiles."""
+"""PyTorch data provider for mining segmentation tiles using Zarr backend."""
 
+import json
 import logging
 from typing import Optional, List, Tuple, Dict, Any
 from pathlib import Path
@@ -7,6 +8,7 @@ import sys
 
 import numpy as np
 import torch
+import zarr
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -14,27 +16,29 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import Config
-from network.database import TileDatabase
 
 logger = logging.getLogger(__name__)
 
 
 class MiningSegmentationDataLoader(Dataset):
-    """PyTorch Dataset for mining segmentation from memory-mapped tiles.
+    """PyTorch Dataset for mining segmentation using Zarr backend.
     
-    Provides lazy-loading access to completely processed Landsat tiles with mining 
-    footprints for training machine learning models. Data is loaded on-demand per tile,
-    not preloaded into memory.
+    Provides efficient lazy-loading access to Landsat tiles with mining footprints.
+    Uses chunked Zarr arrays for optimized batch I/O performance.
     
-    Uses memory-mapped PyTorch tensors for fast, zero-copy data access.
+    The Zarr backend offers:
+    - Efficient chunked storage for batch operations
+    - Cloud-native storage support (S3, GCS)
+    - Single array per data type (easier management)
+    - Optional compression
+    - Parallel write capabilities
     
     Example:
         >>> from network.data_loader import MiningSegmentationDataLoader
         >>> from torch.utils.data import DataLoader
         >>> dataset = MiningSegmentationDataLoader(
         ...     countries=['ZAF'], 
-        ...     years=[2020],
-        ...     bands=['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
+        ...     years=[2020]
         ... )
         >>> loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
         >>> for features, labels in loader:
@@ -43,31 +47,25 @@ class MiningSegmentationDataLoader(Dataset):
     
     def __init__(
         self,
-        db_path: Optional[str] = None,
-        mmap_path: Optional[str] = None,
+        zarr_path: Optional[str] = None,
         config = None,
         countries: Optional[List[str]] = None,
         years: Optional[List[int]] = None,
         cluster_ids: Optional[List[int]] = None,
-        bands: Optional[List[str]] = None,
-        skip_invalid: bool = True,
         normalize: bool = True,
         band_means: Optional[List[float]] = None,
         band_stds: Optional[List[float]] = None,
         auto_compute_stats: bool = True,
         stats_samples: int = 100
     ):
-        """Initialize data loader.
+        """Initialize data loader with Zarr backend.
         
         Args:
-            db_path: Path to database (defaults to config)
-            mmap_path: Path to memory-mapped dataset (defaults to config.MMAP_DIR)
+            zarr_path: Path to Zarr group (defaults to config.ZARR_STORE_PATH)
             config: Configuration instance
             countries: Filter by ISO3 country codes
             years: Filter by years
             cluster_ids: Filter by cluster IDs
-            bands: List of bands to load (default: all Landsat bands)
-            skip_invalid: Whether to skip tiles with invalid data (all NaN)
             normalize: Whether to normalize inputs (default: True)
             band_means: Precomputed band means for normalization (optional)
             band_stds: Precomputed band stds for normalization (optional)
@@ -76,31 +74,56 @@ class MiningSegmentationDataLoader(Dataset):
         """
         self.config = config or Config()
         
-        # Setup database
-        db_path = db_path or str(self.config.DB_PATH)
-        self.db = TileDatabase(db_path)
+        # Setup Zarr path - use global group by default
+        zarr_path = zarr_path or str(self.config.ZARR_STORE_PATH)
+        self.zarr_path = Path(zarr_path)
         
-        # Setup storage paths
-        mmap_path = mmap_path or str(self.config.MMAP_DIR)
-        self.mmap_path = Path(mmap_path)
+        if not self.zarr_path.exists():
+            raise FileNotFoundError(f"Zarr dataset not found: {self.zarr_path}")
         
-        if not self.mmap_path.exists():
-            raise FileNotFoundError(f"MMAP dataset not found: {self.mmap_path}")
+        logger.info(f"Using Zarr backend: {self.zarr_path}")
         
-        logger.info(f"Using memory-mapped backend: {self.mmap_path}")
+        # Don't open Zarr here for multiprocessing safety - open lazily per worker
+        self._zarr_group = None
+        self._features_array = None
+        self._labels_array = None
         
-        # Store filter parameters
-        self.bands = bands or ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
-        self.skip_invalid = skip_invalid
+        # Open temporarily to check for index arrays and get metadata
+        temp_group = zarr.open_group(store=str(self.zarr_path), mode='r')
         
-        # Get filtered tiles first
-        self.tiles = self.get_written_tiles(countries, years, cluster_ids)
+        # Build tile list from index arrays if available, otherwise fallback to metadata
+        if 'cluster_ids' in temp_group and 'tile_ix' in temp_group:
+            logger.info("Using index arrays from Zarr group")
+            all_tiles = self._tiles_from_index_arrays(temp_group)
+        else:
+            logger.info("Index arrays not found, loading from metadata.json")
+            metadata_path = self.zarr_path.parent / "metadata" / "tiles.json"
+            if not metadata_path.exists():
+                raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+            
+            with open(metadata_path, 'r') as f:
+                all_tiles = json.load(f)
+        
+        # Get array shapes for logging
+        self._n_bands = temp_group['features'].shape[1]
+        self._feature_shape = temp_group['features'].shape
+        self._feature_chunks = temp_group['features'].chunks
+        self._label_shape = temp_group['labels'].shape
+        self._label_chunks = temp_group['labels'].chunks
+        
+        # Apply filters
+        self.tiles = self._filter_tiles(all_tiles, countries, years, cluster_ids)
         
         if not self.tiles:
             raise ValueError("No tiles found matching filters")
         
-        # Normalization parameters (critical for convergence)
+        # Build lookup dict for O(1) tile access by coordinates
+        self._tile_lookup = self._build_tile_lookup()
+        
+        # Normalization parameters
         self.normalize = normalize
+        
+        logger.info(f"Loaded {len(self.tiles)} tiles matching filters")
         
         # Compute statistics once if not provided and normalization is enabled
         if normalize and band_means is None and auto_compute_stats:
@@ -111,74 +134,109 @@ class MiningSegmentationDataLoader(Dataset):
             self.band_means = band_means
             self.band_stds = band_stds
         
-        logger.info(f"Initialized dataset with {len(self.tiles)} tiles using memory-mapped backend")
-        logger.info(f"Normalization enabled: {normalize} (precomputed: {band_means is not None})")
+        logger.info(f"Initialized Zarr dataset with {len(self.tiles)} tiles")
+        logger.info(f"  Features: shape={self._feature_shape}, chunks={self._feature_chunks}")
+        logger.info(f"  Labels: shape={self._label_shape}, chunks={self._label_chunks}")
+        logger.info(f"  Normalization enabled: {normalize} (precomputed: {band_means is not None})")
+    
+    @property
+    def zarr_group(self):
+        """Lazy-load Zarr group (multiprocessing-safe)."""
+        if self._zarr_group is None:
+            self._zarr_group = zarr.open_group(store=str(self.zarr_path), mode='r')
+        return self._zarr_group
+    
+    @property
+    def features_array(self):
+        """Lazy-load features array (multiprocessing-safe)."""
+        if self._features_array is None:
+            self._features_array = self.zarr_group['features']
+        return self._features_array
+    
+    @property
+    def labels_array(self):
+        """Lazy-load labels array (multiprocessing-safe)."""
+        if self._labels_array is None:
+            self._labels_array = self.zarr_group['labels']
+        return self._labels_array
     
     @staticmethod
-    def _get_tile_path(cluster_id: int, year: int, tile_ix: int, tile_iy: int) -> str:
-        """Reconstruct mmap path from tile coordinates.
-        
-        Args:
-            cluster_id: Cluster ID
-            year: Year
-            tile_ix: Tile X index
-            tile_iy: Tile Y index
-            
-        Returns:
-            Relative path to tile directory: cluster_id/year/tile_ix_tile_iy
-        """
-        return f"{cluster_id}/{year}/{tile_ix}_{tile_iy}"
-    
-    def get_written_tiles(
-        self,
+    def _filter_tiles(
+        all_tiles: List[Dict[str, Any]],
         countries: Optional[List[str]] = None,
         years: Optional[List[int]] = None,
         cluster_ids: Optional[List[int]] = None
     ) -> List[Dict[str, Any]]:
-        """Get all written tiles matching filters.
+        """Filter tiles by countries, years, or cluster IDs.
         
         Args:
+            all_tiles: List of all tile metadata
             countries: Filter by ISO3 country codes
             years: Filter by years
             cluster_ids: Filter by cluster IDs
             
         Returns:
-            List of tile dicts with metadata
+            Filtered list of tile dicts
         """
-        return self.db.get_written_tiles(countries, years, cluster_ids)
+        filtered = all_tiles
+        
+        if countries:
+            filtered = [t for t in filtered if t['country_code'] in countries]
+            logger.info(f"Filtered to {len(filtered)} tiles by countries: {countries}")
+        
+        if years:
+            filtered = [t for t in filtered if t['year'] in years]
+            logger.info(f"Filtered to {len(filtered)} tiles by years: {years}")
+        
+        if cluster_ids:
+            filtered = [t for t in filtered if t['cluster_id'] in cluster_ids]
+            logger.info(f"Filtered to {len(filtered)} tiles by cluster_ids: {cluster_ids}")
+        
+        return filtered
     
-    def load_tile_data(
-        self,
-        tile_ix: int,
-        tile_iy: int,
-        year: int,
-        cluster_id: int,
-        bands: Optional[List[str]] = None,
-        include_footprint: bool = True
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Load data for a specific tile from memory-mapped storage.
+    def _build_tile_lookup(self) -> Dict[Tuple[int, int, int], int]:
+        """Build lookup dict for fast tile access by coordinates.
+        
+        Returns:
+            Dict mapping (tile_ix, tile_iy, year) -> index in self.tiles
+        """
+        lookup = {}
+        for idx, tile in enumerate(self.tiles):
+            key = (tile['tile_ix'], tile['tile_iy'], tile['year'])
+            lookup[key] = idx
+        return lookup
+    
+    def _tiles_from_index_arrays(self, zarr_group) -> List[Dict[str, Any]]:
+        """Build tile list from Zarr index arrays.
         
         Args:
-            tile_ix: Tile X index
-            tile_iy: Tile Y index
-            year: Year
-            cluster_id: Cluster ID (needed to reconstruct path)
-            bands: List of bands to load (not used, kept for compatibility)
-            include_footprint: Whether to load mining footprint
-            
+            zarr_group: Temporary Zarr group for reading indices
+        
         Returns:
-            Tuple of (features, labels) where:
-                - features: torch tensor of shape (C, H, W)
-                - labels: torch tensor of shape (1, H, W)
+            List of tile metadata dicts from index arrays
         """
-        # Reconstruct path from coordinates
-        mmap_path = self._get_tile_path(cluster_id, year, tile_ix, tile_iy)
-        tile_dir = self.mmap_path / mmap_path
-        
-        features = torch.load(tile_dir / "features.pt")
-        labels = torch.load(tile_dir / "labels.pt") if include_footprint else None
-        
-        return features, labels
+        try:
+            cluster_ids = np.array(zarr_group['cluster_ids'][:])
+            tile_ix = np.array(zarr_group['tile_ix'][:])
+            tile_iy = np.array(zarr_group['tile_iy'][:])
+            years = np.array(zarr_group['years'][:])
+            
+            tiles = []
+            for idx in range(len(cluster_ids)):
+                tiles.append({
+                    'cluster_id': int(cluster_ids[idx]),
+                    'tile_ix': int(tile_ix[idx]),
+                    'tile_iy': int(tile_iy[idx]),
+                    'year': int(years[idx]),
+                    'country_code': 'UNKNOWN',  # Not tracked in index arrays
+                    'geometry_hash': ''  # Not tracked in index arrays
+                })
+            
+            logger.info(f"Built tile list from {len(tiles)} index entries")
+            return tiles
+        except Exception as e:
+            logger.warning(f"Could not build tile list from index arrays: {e}")
+            return []
     
     def __len__(self) -> int:
         """Return the number of tiles in the dataset.
@@ -189,7 +247,7 @@ class MiningSegmentationDataLoader(Dataset):
         return len(self.tiles)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a single tile by index (lazy loading).
+        """Get a single tile by index (lazy loading from Zarr).
         
         Args:
             idx: Tile index
@@ -199,18 +257,11 @@ class MiningSegmentationDataLoader(Dataset):
                 - features: torch.Tensor of shape (C, H, W)
                 - labels: torch.Tensor of shape (1, H, W)
         """
-        tile = self.tiles[idx]
+        # Load from Zarr (efficient, uses chunks)
+        features = torch.from_numpy(np.array(self.features_array[idx])).float()
+        labels = torch.from_numpy(np.array(self.labels_array[idx])).float()
         
-        # Reconstruct path and load from memory-mapped storage
-        mmap_path = self._get_tile_path(
-            tile['cluster_id'], tile['year'], tile['tile_ix'], tile['tile_iy']
-        )
-        tile_dir = self.mmap_path / mmap_path
-        features = torch.load(tile_dir / "features.pt").float()
-        labels = torch.load(tile_dir / "labels.pt").float()
-        
-        # Normalize features (critical for convergence)
-        # Per-channel standardization using precomputed statistics
+        # Normalize features
         if self.normalize and self.band_means is not None:
             mean = torch.tensor(self.band_means, dtype=torch.float32).view(-1, 1, 1)
             std = torch.tensor(self.band_stds, dtype=torch.float32).view(-1, 1, 1)
@@ -219,7 +270,7 @@ class MiningSegmentationDataLoader(Dataset):
         return features, labels
     
     def get_tile_by_index(self, tile_ix: int, tile_iy: int, year: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get a specific tile by its coordinates.
+        """Get a specific tile by its coordinates (O(1) lookup).
         
         Args:
             tile_ix: Tile X index
@@ -229,22 +280,27 @@ class MiningSegmentationDataLoader(Dataset):
         Returns:
             Tuple of (features, labels) as torch tensors
         """
-        # Find tile in list
-        tile = next((t for t in self.tiles if t['tile_ix'] == tile_ix and t['tile_iy'] == tile_iy and t['year'] == year), None)
+        # Fast O(1) lookup using dict
+        key = (tile_ix, tile_iy, year)
+        idx = self._tile_lookup.get(key)
         
-        if not tile:
+        if idx is None:
             raise ValueError(f"Tile not found: {tile_ix}, {tile_iy}, {year}")
         
-        features, labels = self.load_tile_data(
-            tile_ix,
-            tile_iy,
-            year,
-            tile['cluster_id'],
-            bands=self.bands,
-            include_footprint=True
-        )
+        return self[idx]
+    
+    def get_tile_metadata(self, idx: int) -> Dict[str, Any]:
+        """Get metadata for a specific tile by index.
         
-        return features, labels
+        Args:
+            idx: Tile index
+            
+        Returns:
+            Tile metadata dict
+        """
+        if idx < 0 or idx >= len(self.tiles):
+            raise ValueError(f"Index out of range: {idx}")
+        return self.tiles[idx]
     
     def get_statistics(self) -> Dict[str, Any]:
         """Get statistics about the current dataset.
@@ -257,7 +313,9 @@ class MiningSegmentationDataLoader(Dataset):
                 'total_tiles': 0,
                 'countries': {},
                 'years': {},
-                'clusters': {}
+                'clusters': {},
+                'shape': None,
+                'chunks': None
             }
         
         # Count by country
@@ -280,15 +338,16 @@ class MiningSegmentationDataLoader(Dataset):
         
         return {
             'total_tiles': len(self.tiles),
-            'num_bands': len(self.bands),
-            'bands': self.bands,
+            'num_bands': self.features_array.shape[1],
             'countries': countries_count,
             'years': years_count,
-            'clusters': clusters_count
+            'clusters': clusters_count,
+            'shape': self.features_array.shape,
+            'chunks': self.features_array.chunks
         }
     
     def _compute_stats_fast(self, max_samples: int = 100) -> Tuple[List[float], List[float]]:
-        """Fast computation of normalization statistics without going through __getitem__.
+        """Fast computation of normalization statistics from Zarr arrays.
         
         Args:
             max_samples: Maximum number of samples to use
@@ -299,36 +358,26 @@ class MiningSegmentationDataLoader(Dataset):
         n_samples = min(max_samples, len(self.tiles))
         indices = np.random.choice(len(self.tiles), n_samples, replace=False)
         
+        # Get number of bands from array shape
+        n_bands = self.features_array.shape[1]
+        
         # Accumulate statistics
-        band_sums = np.zeros(len(self.bands))
-        band_sq_sums = np.zeros(len(self.bands))
+        band_sums = np.zeros(n_bands)
+        band_sq_sums = np.zeros(n_bands)
         total_pixels = 0
         
         for idx in indices:
-            tile = self.tiles[idx]
-            # Load directly without normalization
-            features, _ = self.load_tile_data(
-                tile['tile_ix'],
-                tile['tile_iy'],
-                tile['year'],
-                tile['cluster_id'],
-                bands=self.bands,
-                include_footprint=False
-            )
-            # Convert torch tensor to numpy and transpose from (C, H, W) to (H, W, C)
-            if isinstance(features, torch.Tensor):
-                features = features.numpy()
-            if features.shape[0] == len(self.bands):
-                features = features.transpose(1, 2, 0)
+            # Load from Zarr
+            features = np.array(self.features_array[idx])  # Shape: (C, H, W)
             features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
             
-            # features shape: (H, W, C)
-            for c in range(features.shape[2]):
-                channel = features[:, :, c]
+            # Compute stats per channel
+            for c in range(n_bands):
+                channel = features[c]
                 band_sums[c] += channel.sum()
                 band_sq_sums[c] += (channel ** 2).sum()
             
-            total_pixels += features.shape[0] * features.shape[1]
+            total_pixels += features.shape[1] * features.shape[2]
         
         # Compute means and stds
         band_means = band_sums / total_pixels
@@ -354,36 +403,26 @@ class MiningSegmentationDataLoader(Dataset):
         n_samples = min(max_samples, len(self.tiles))
         indices = np.random.choice(len(self.tiles), n_samples, replace=False)
         
+        # Get number of bands from cached shape
+        n_bands = self._n_bands
+        
         # Accumulate statistics
-        band_sums = np.zeros(len(self.bands))
-        band_sq_sums = np.zeros(len(self.bands))
+        band_sums = np.zeros(n_bands)
+        band_sq_sums = np.zeros(n_bands)
         total_pixels = 0
         
         for idx in tqdm(indices, desc="Computing stats"):
-            tile = self.tiles[idx]
-            # Load directly without normalization to avoid recursion
-            features, _ = self.load_tile_data(
-                tile['tile_ix'],
-                tile['tile_iy'],
-                tile['year'],
-                tile['cluster_id'],
-                bands=self.bands,
-                include_footprint=False
-            )
-            # Convert torch tensor to numpy and transpose from (C, H, W) to (H, W, C)
-            if isinstance(features, torch.Tensor):
-                features = features.numpy()
-            if features.shape[0] == len(self.bands):
-                features = features.transpose(1, 2, 0)
+            # Load from Zarr
+            features = np.array(self.features_array[idx])  # Shape: (C, H, W)
             features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
             
-            # features shape: (H, W, C)
-            for c in range(features.shape[2]):
-                channel = features[:, :, c]
+            # Compute stats per channel
+            for c in range(n_bands):
+                channel = features[c]
                 band_sums[c] += channel.sum()
                 band_sq_sums[c] += (channel ** 2).sum()
             
-            total_pixels += features.shape[0] * features.shape[1]
+            total_pixels += features.shape[1] * features.shape[2]
         
         # Compute means and stds
         band_means = band_sums / total_pixels
@@ -391,8 +430,8 @@ class MiningSegmentationDataLoader(Dataset):
         band_stds = np.sqrt(np.maximum(band_vars, 0))
         
         logger.info(f"Computed statistics from {n_samples} samples:")
-        for i, band in enumerate(self.bands):
-            logger.info(f"  {band}: mean={band_means[i]:.4f}, std={band_stds[i]:.4f}")
+        for i in range(n_bands):
+            logger.info(f"  Band {i}: mean={band_means[i]:.4f}, std={band_stds[i]:.4f}")
         
         return band_means.tolist(), band_stds.tolist()
     
@@ -426,51 +465,34 @@ class MiningSegmentationDataLoader(Dataset):
             pin_memory=pin_memory
         )
     
-    def get_tile_statistics(
-        self,
-        countries: Optional[List[str]] = None,
-        years: Optional[List[int]] = None
-    ) -> Dict[str, Any]:
-        """Get statistics about available tiles.
+    def list_available_tiles(self) -> List[Dict[str, Any]]:
+        """List all tiles in the dataset with their metadata.
         
-        Args:
-            countries: Filter by ISO3 country codes
-            years: Filter by years
-            
         Returns:
-            Dictionary with tile statistics
+            List of tile metadata dicts
         """
-        tiles = self.get_written_tiles(countries, years)
+        return self.tiles
+    
+    def get_tile_count_by_country(self) -> Dict[str, int]:
+        """Get tile count grouped by country.
         
-        if not tiles:
-            return {
-                'total_tiles': 0,
-                'countries': {},
-                'years': {},
-                'clusters': {}
-            }
-        
-        # Count by country
-        countries_count = {}
-        for tile in tiles:
+        Returns:
+            Dict mapping country code to tile count
+        """
+        counts = {}
+        for tile in self.tiles:
             country = tile['country_code']
-            countries_count[country] = countries_count.get(country, 0) + 1
+            counts[country] = counts.get(country, 0) + 1
+        return counts
+    
+    def get_tile_count_by_year(self) -> Dict[int, int]:
+        """Get tile count grouped by year.
         
-        # Count by year
-        years_count = {}
-        for tile in tiles:
+        Returns:
+            Dict mapping year to tile count
+        """
+        counts = {}
+        for tile in self.tiles:
             year = tile['year']
-            years_count[year] = years_count.get(year, 0) + 1
-        
-        # Count by cluster
-        clusters_count = {}
-        for tile in tiles:
-            cluster = tile['cluster_id']
-            clusters_count[cluster] = clusters_count.get(cluster, 0) + 1
-        
-        return {
-            'total_tiles': len(tiles),
-            'countries': countries_count,
-            'years': years_count,
-            'clusters': clusters_count
-        }
+            counts[year] = counts.get(year, 0) + 1
+        return counts

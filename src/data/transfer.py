@@ -10,6 +10,10 @@ import json
 from typing import Optional, List
 from pathlib import Path
 from datetime import datetime
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from .database import DownloadDatabase
 from .config import Config

@@ -14,16 +14,20 @@ from pathlib import Path
 # ============================================================================
 
 def dice_loss(y_pred, y_true, smooth=1e-6):
-    """Dice loss for binary segmentation.
+    """Dice loss for binary segmentation (accepts logits or probabilities).
     
     Args:
-        y_pred: Predicted mask (batch, 1, H, W)
+        y_pred: Predicted logits or probabilities (batch, 1, H, W)
         y_true: Ground truth mask (batch, 1, H, W)
         smooth: Smoothing factor
         
     Returns:
         Dice loss value
     """
+    # Convert logits to probabilities if needed
+    if y_pred.min() < 0 or y_pred.max() > 1:
+        y_pred = torch.sigmoid(y_pred)
+    
     y_pred_f = y_pred.view(-1)
     y_true_f = y_true.view(-1)
     
@@ -34,10 +38,10 @@ def dice_loss(y_pred, y_true, smooth=1e-6):
 
 
 def focal_loss(y_pred, y_true, alpha=0.25, gamma=2.0):
-    """Focal loss for handling class imbalance.
+    """Focal loss for handling class imbalance (accepts logits or probabilities).
     
     Args:
-        y_pred: Predicted mask (batch, 1, H, W)
+        y_pred: Predicted logits or probabilities (batch, 1, H, W)
         y_true: Ground truth mask (batch, 1, H, W)
         alpha: Weighting factor
         gamma: Focusing parameter
@@ -46,6 +50,11 @@ def focal_loss(y_pred, y_true, alpha=0.25, gamma=2.0):
         Focal loss value
     """
     epsilon = 1e-7
+    
+    # Convert logits to probabilities if needed
+    if y_pred.min() < 0 or y_pred.max() > 1:
+        y_pred = torch.sigmoid(y_pred)
+    
     y_pred = torch.clamp(y_pred, epsilon, 1. - epsilon)
     
     # Calculate focal loss
@@ -62,10 +71,10 @@ def focal_loss(y_pred, y_true, alpha=0.25, gamma=2.0):
 
 
 def combined_loss(y_pred, y_true, bce_weight=0.5, dice_weight=0.5):
-    """Combined BCE and Dice loss.
+    """Combined BCE and Dice loss (accepts logits or probabilities).
     
     Args:
-        y_pred: Predicted mask (batch, 1, H, W)
+        y_pred: Predicted logits or probabilities (batch, 1, H, W)
         y_true: Ground truth mask (batch, 1, H, W)
         bce_weight: Weight for BCE loss
         dice_weight: Weight for Dice loss
@@ -73,7 +82,14 @@ def combined_loss(y_pred, y_true, bce_weight=0.5, dice_weight=0.5):
     Returns:
         Combined loss value
     """
-    bce = F.binary_cross_entropy(y_pred, y_true)
+    # Check if input is logits or probabilities
+    if y_pred.min() < 0 or y_pred.max() > 1:
+        # Input is logits, use BCEWithLogitsLoss
+        bce = F.binary_cross_entropy_with_logits(y_pred, y_true)
+    else:
+        # Input is probabilities, use BCELoss
+        bce = F.binary_cross_entropy(y_pred, y_true)
+    
     dice = dice_loss(y_pred, y_true)
     
     return bce_weight * bce + dice_weight * dice
@@ -99,9 +115,13 @@ class DiceCoefficient:
         """Update metric with batch predictions.
         
         Args:
-            y_pred: Predicted mask (batch, 1, H, W)
+            y_pred: Predicted logits or probabilities (batch, 1, H, W)
             y_true: Ground truth mask (batch, 1, H, W)
         """
+        # Convert logits to probabilities if needed
+        if y_pred.min() < 0 or y_pred.max() > 1:
+            y_pred = torch.sigmoid(y_pred)
+        
         y_pred = (y_pred > 0.5).float()
         y_true = y_true.float()
         
@@ -132,9 +152,13 @@ class IoU:
         """Update metric with batch predictions.
         
         Args:
-            y_pred: Predicted mask (batch, 1, H, W)
+            y_pred: Predicted logits or probabilities (batch, 1, H, W)
             y_true: Ground truth mask (batch, 1, H, W)
         """
+        # Convert logits to probabilities if needed
+        if y_pred.min() < 0 or y_pred.max() > 1:
+            y_pred = torch.sigmoid(y_pred)
+        
         y_pred = (y_pred > 0.5).float()
         y_true = y_true.float()
         

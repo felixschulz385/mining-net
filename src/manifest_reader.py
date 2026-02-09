@@ -1,4 +1,8 @@
-"""Utility to read and validate manifest files."""
+"""Utility to read and validate manifest files.
+
+Lightweight manifest reader with no heavy dependencies.
+Used by data_loader for efficient tile indexing on HPC.
+"""
 
 import json
 import logging
@@ -9,20 +13,23 @@ logger = logging.getLogger(__name__)
 
 
 class ManifestReader:
-    """Reader for cluster manifest files."""
+    """Reader for cluster manifest files with caching."""
     
-    def __init__(self, manifests_dir: Path):
+    def __init__(self, manifests_dir: Path, cache_manifests: bool = True):
         """Initialize manifest reader.
         
         Args:
             manifests_dir: Directory containing manifest files
+            cache_manifests: Whether to cache manifests in memory (default: True)
         """
         self.manifests_dir = Path(manifests_dir)
+        self.cache_manifests = cache_manifests
+        self._manifest_cache: Dict[int, Dict[str, Any]] = {}
         if not self.manifests_dir.exists():
             logger.warning(f"Manifests directory does not exist: {manifests_dir}")
     
     def read_manifest(self, cluster_id: int) -> Optional[Dict[str, Any]]:
-        """Read a manifest file for a cluster.
+        """Read a manifest file for a cluster (with caching).
         
         Args:
             cluster_id: Cluster ID
@@ -30,6 +37,10 @@ class ManifestReader:
         Returns:
             Manifest dict or None if not found
         """
+        # Check cache first
+        if self.cache_manifests and cluster_id in self._manifest_cache:
+            return self._manifest_cache[cluster_id]
+        
         manifest_path = self.manifests_dir / f"cluster_{cluster_id}_manifest.json"
         
         if not manifest_path.exists():
@@ -40,7 +51,11 @@ class ManifestReader:
             with open(manifest_path, 'r') as f:
                 manifest = json.load(f)
             
-            logger.info(f"Read manifest for cluster {cluster_id}: {manifest['tile_count']} tiles")
+            # Cache if enabled
+            if self.cache_manifests:
+                self._manifest_cache[cluster_id] = manifest
+            
+            logger.debug(f"Read manifest for cluster {cluster_id}: {manifest['tile_count']} tiles")
             return manifest
             
         except Exception as e:
@@ -48,7 +63,7 @@ class ManifestReader:
             return None
     
     def list_all_manifests(self) -> List[Dict[str, Any]]:
-        """List all available manifests.
+        """List all available manifests (lightweight metadata only).
         
         Returns:
             List of manifest metadata (cluster_id, country, tile_count, years)
@@ -74,6 +89,22 @@ class ManifestReader:
                 logger.error(f"Error reading manifest {manifest_path}: {e}")
         
         return sorted(manifests, key=lambda x: x['cluster_id'])
+    
+    def read_manifests_batch(self, cluster_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """Read multiple manifests efficiently.
+        
+        Args:
+            cluster_ids: List of cluster IDs to read
+            
+        Returns:
+            Dict mapping cluster_id to manifest data
+        """
+        results = {}
+        for cluster_id in cluster_ids:
+            manifest = self.read_manifest(cluster_id)
+            if manifest:
+                results[cluster_id] = manifest
+        return results
     
     def validate_manifest(self, cluster_id: int, data_dir: Path) -> Dict[str, Any]:
         """Validate that a manifest matches the actual data on disk.

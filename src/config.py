@@ -41,7 +41,11 @@ class Config:
     # Database
     DB_PATH = DATA_DIR / "mining_segmentation.db"
     
-    # Memory-mapped data storage
+    # Zarr data storage (unified group for all tiles)
+    ZARR_DIR = DATA_DIR / "landsat_zarr"
+    ZARR_STORE_PATH = ZARR_DIR / "data.zarr"
+    
+    # Legacy: Memory-mapped data storage (deprecated)
     MMAP_DIR = DATA_DIR / "landsat_mmap"
     
     # Model paths

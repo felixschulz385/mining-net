@@ -231,7 +231,8 @@ class DownloadDatabase:
             fields["completed_at"] = datetime.utcnow().isoformat()
         elif status == "downloaded" and "downloaded_at" not in fields:
             fields["downloaded_at"] = datetime.utcnow().isoformat()
-        elif status == "reprojected" and "reprojected_at" not in fields:
+        elif status in ("reprojected", "stored") and "reprojected_at" not in fields:
+            # Use reprojected_at for both (backward compatibility)
             fields["reprojected_at"] = datetime.utcnow().isoformat()
         
         set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
@@ -439,7 +440,28 @@ class DownloadDatabase:
         year: int,
         cluster_id: int
     ):
-        """Mark a tile as written to memory-mapped format.
+        """Mark a tile as written to memory-mapped format (deprecated).
+        
+        Kept for backward compatibility. Use mark_tile_stored instead.
+        
+        Args:
+            tile_ix: Tile X index
+            tile_iy: Tile Y index
+            geometry_hash: Geometry hash
+            year: Year
+            cluster_id: Cluster ID for the tile
+        """
+        self.mark_tile_stored(tile_ix, tile_iy, geometry_hash, year, cluster_id)
+    
+    def mark_tile_stored(
+        self,
+        tile_ix: int,
+        tile_iy: int,
+        geometry_hash: str,
+        year: int,
+        cluster_id: int
+    ):
+        """Mark a tile as stored (in Zarr format).
         
         Args:
             tile_ix: Tile X index

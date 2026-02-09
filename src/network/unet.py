@@ -219,11 +219,8 @@ class UNet(nn.Module):
             )
             current_channels = out_channels
         
-        # Output layer
-        self.output_layer = nn.Sequential(
-            nn.Conv2d(current_channels, num_classes, kernel_size=1),
-            nn.Sigmoid()
-        )
+        # Output layer (logits, no activation - for use with BCEWithLogitsLoss)
+        self.output_layer = nn.Conv2d(current_channels, num_classes, kernel_size=1)
     
     def forward(self, x):
         """Forward pass.

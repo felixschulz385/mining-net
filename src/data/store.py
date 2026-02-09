@@ -1,21 +1,31 @@
-"""Reprojection worker to convert downloaded GeoTIFFs to memory-mapped PyTorch format."""
+"""Storage worker to convert downloaded GeoTIFFs to Zarr format.
+
+This worker replaces the old reprojection worker. Instead of creating memory-mapped
+PyTorch files (.pt), it creates a single large Zarr group with all tiles.
+
+The worker:
+1. Loads downloaded GeoTIFF files
+2. Reprojects to the world geobox grid
+3. Appends tiles to global Zarr arrays (features, labels, indices)
+4. Maintains index arrays for cluster_id, tile_ix, tile_iy, year
+5. Uses chunking for efficient batch access
+"""
 
 import time
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List
 from pathlib import Path
 import warnings
 import json
 
 import numpy as np
-import torch
+import zarr
 import xarray as xr
 import rioxarray as rxr
 from odc.geo.geobox import GeoBox, GeoboxTiles, geobox_union_conservative
 from odc.geo.geom import Geometry
 from odc.geo.xr import rasterize
 from shapely.geometry import shape
-import rasterio.env
 
 from .database import DownloadDatabase
 from .config import Config
@@ -29,11 +39,11 @@ logging.getLogger('rasterio._env').setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 
-class ReprojectionWorker:
-    """Worker to reproject downloaded files to memory-mapped format."""
+class StorageWorker:
+    """Worker to store downloaded files in Zarr format."""
     
     def __init__(self, db: DownloadDatabase, config: Optional[Config] = None, countries: Optional[List[str]] = None, mining_file: Optional[str] = None):
-        """Initialize reprojection worker.
+        """Initialize storage worker.
         
         Args:
             db: Database instance
@@ -44,7 +54,7 @@ class ReprojectionWorker:
         self.db = db
         self.config = config or Config()
         self.countries = countries
-        self.worker_name = "reprojection"
+        self.worker_name = "storage"
         
         # Setup world geobox
         self.world_geobox = GeoBox.from_bbox(
@@ -57,19 +67,131 @@ class ReprojectionWorker:
             self.config.WORLD_GEOBOX_TILE_SIZE
         )
         
-        # Setup MMAP output directory
-        self.mmap_path = self.config.DATA_DIR / "landsat_mmap"
-        self.mmap_path.mkdir(exist_ok=True, parents=True)
+        # Setup Zarr output directory
+        self.zarr_path = self.config.DATA_DIR / "landsat_zarr"
+        self.zarr_path.mkdir(exist_ok=True, parents=True)
         
         # Bands to process
         self.bands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
         
-        logger.info(f"Initialized reprojection worker with MMAP output: {self.mmap_path}")
-    
-    def reproject_to_mmap(self, task_data: dict) -> bool:
-        """Reproject downloaded file to grid and save as memory-mapped PyTorch tensors.
+        # Initialize or open Zarr group
+        self._init_zarr_store()
         
-        Reprojects entire cluster once, then extracts and stores individual tiles for efficiency.
+        logger.info(f"Initialized storage worker with Zarr output: {self.zarr_path}")
+    
+    def _init_zarr_store(self):
+        """Initialize or open the global Zarr store with resizable arrays."""
+        store_path = self.zarr_path / "data.zarr"
+        metadata_path = self.zarr_path / "store_metadata.json"
+        
+        # Load or create metadata tracking current position
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                self.store_metadata = json.load(f)
+        else:
+            self.store_metadata = {
+                "next_index": 0,
+                "tile_size": self.config.WORLD_GEOBOX_TILE_SIZE,
+                "n_bands": len(self.bands),
+                "chunk_size": 8,
+                "format_version": "1.0"
+            }
+            with open(metadata_path, 'w') as f:
+                json.dump(self.store_metadata, f, indent=2)
+        
+        self.metadata_path = metadata_path
+        tile_h, tile_w = self.config.WORLD_GEOBOX_TILE_SIZE
+        n_bands = len(self.bands)
+        chunk_size = self.store_metadata["chunk_size"]
+        
+        # Open or create Zarr group
+        if store_path.exists():
+            self.zarr_group = zarr.open_group(store=str(store_path), mode='r+')
+            logger.info(f"Opened existing Zarr store at {store_path}")
+        else:
+            # Create new Zarr group with initial arrays
+            self.zarr_group = zarr.open_group(store=str(store_path), mode='w')
+            
+            # Create resizable arrays with initial size
+            initial_size = 1000  # Will grow as needed
+            
+            self.zarr_group.create_array(
+                'features',
+                shape=(initial_size, n_bands, tile_h, tile_w),
+                chunks=(chunk_size, n_bands, tile_h, tile_w),
+                dtype=np.float32,
+                compressors=zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
+            )
+            
+            self.zarr_group.create_array(
+                'labels',
+                shape=(initial_size, 1, tile_h, tile_w),
+                chunks=(chunk_size, 1, tile_h, tile_w),
+                dtype=np.float32,
+                compressors=zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
+            )
+            
+            # Index arrays
+            self.zarr_group.create_array(
+                'cluster_ids',
+                shape=(initial_size,),
+                chunks=(chunk_size * 1000,),  # Larger chunks for index arrays
+                dtype=np.int64,
+                compressors=zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
+            )
+            
+            self.zarr_group.create_array(
+                'tile_ix',
+                shape=(initial_size,),
+                chunks=(chunk_size * 1000,),
+                dtype=np.int32,
+                compressors=zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
+            )
+            
+            self.zarr_group.create_array(
+                'tile_iy',
+                shape=(initial_size,),
+                chunks=(chunk_size * 1000,),
+                dtype=np.int32,
+                compressors=zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
+            )
+            
+            self.zarr_group.create_array(
+                'years',
+                shape=(initial_size,),
+                chunks=(chunk_size * 1000,),
+                dtype=np.int32,
+                compressors=zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
+            )
+            
+            logger.info(f"Created new Zarr store at {store_path}")
+    
+    def _ensure_capacity(self, n_new_tiles: int):
+        """Ensure Zarr arrays have enough capacity for new tiles."""
+        next_idx = self.store_metadata["next_index"]
+        current_size = self.zarr_group['features'].shape[0]
+        required_size = next_idx + n_new_tiles
+        
+        if required_size > current_size:
+            # Resize to accommodate new tiles with some buffer
+            new_size = max(required_size, int(current_size * 1.5))
+            logger.info(f"Resizing Zarr arrays from {current_size} to {new_size}")
+            
+            for array_name in ['features', 'labels', 'cluster_ids', 'tile_ix', 'tile_iy', 'years']:
+                array = self.zarr_group[array_name]
+                new_shape = list(array.shape)
+                new_shape[0] = new_size
+                array.resize(tuple(new_shape))
+    
+    def _save_metadata(self):
+        """Save metadata to disk."""
+        with open(self.metadata_path, 'w') as f:
+            json.dump(self.store_metadata, f, indent=2)
+    
+    def store_to_zarr(self, task_data: dict) -> bool:
+        """Store downloaded file to grid and save as Zarr arrays.
+        
+        Reprojects entire cluster once, then extracts and stores individual tiles to global Zarr.
         
         Args:
             task_data: Task data from database
@@ -96,7 +218,7 @@ class ReprojectionWorker:
                 return False
             
             # Load the image
-            logger.info(f"Processing {len(tiles)} tiles to MMAP format for {country_code} {year}")
+            logger.info(f"Processing {len(tiles)} tiles to Zarr format for {country_code} {year}")
             image = rxr.open_rasterio(filepath)
             
             # Get mining footprint from database
@@ -139,10 +261,17 @@ class ReprojectionWorker:
             if mining_geom:
                 mining_footprint_union = rasterize(Geometry(mining_geom, crs=4326), union_geobox)
             
-            # Extract and store individual tiles
-            for tile in tiles:
+            # Ensure we have capacity for these tiles
+            self._ensure_capacity(len(tiles))
+            
+            # Get starting index for this batch
+            start_idx = self.store_metadata["next_index"]
+            
+            # Extract and store individual tiles to global Zarr arrays
+            for i, tile in enumerate(tiles):
                 tile_ix = tile['tile_ix']
                 tile_iy = tile['tile_iy']
+                current_idx = start_idx + i
                 
                 # Get tile geobox
                 tile_geobox = world_geobox_tiles[tile_ix, tile_iy]
@@ -157,8 +286,8 @@ class ReprojectionWorker:
                     for band in self.bands
                 ]
                 
-                # Stack bands to (H, W, C)
-                features = np.stack(band_arrays, axis=-1).astype(np.float32)
+                # Stack bands to (C, H, W)
+                features = np.stack(band_arrays, axis=0).astype(np.float32)
                 
                 # Extract mining footprint for this tile
                 if mining_footprint_union is not None:
@@ -170,49 +299,33 @@ class ReprojectionWorker:
                     labels = np.zeros(tile_geobox.shape, dtype=np.float32)
                 
                 if labels.ndim == 2:
-                    labels = labels[..., np.newaxis]
+                    labels = labels[np.newaxis, ...]  # Add channel dimension (1, H, W)
                 
                 # Replace NaN with 0
                 features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
                 labels = np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
                 
-                # Convert to torch tensors: (H, W, C) -> (C, H, W)
-                features_tensor = torch.from_numpy(features).float().permute(2, 0, 1)
-                labels_tensor = torch.from_numpy(labels).float().permute(2, 0, 1)
+                # Write to global Zarr arrays at current index
+                self.zarr_group['features'][current_idx] = features
+                self.zarr_group['labels'][current_idx] = labels
+                self.zarr_group['cluster_ids'][current_idx] = cluster_id
+                self.zarr_group['tile_ix'][current_idx] = tile_ix
+                self.zarr_group['tile_iy'][current_idx] = tile_iy
+                self.zarr_group['years'][current_idx] = year
                 
-                # Create tile directory: cluster_id/year/tile_ix_tile_iy/
-                tile_dir = self.mmap_path / str(cluster_id) / str(year) / f"{tile_ix}_{tile_iy}"
-                tile_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Save tensors
-                torch.save(features_tensor, tile_dir / "features.pt")
-                torch.save(labels_tensor, tile_dir / "labels.pt")
-                
-                # Save metadata
-                metadata = {
-                    "tile_ix": tile_ix,
-                    "tile_iy": tile_iy,
-                    "year": year,
-                    "cluster_id": cluster_id,
-                    "geometry_hash": geometry_hash,
-                    "features_shape": list(features_tensor.shape),
-                    "labels_shape": list(labels_tensor.shape),
-                    "bands": self.bands,
-                    "dtype": "float32"
-                }
-                
-                with open(tile_dir / "metadata.json", 'w') as f:
-                    json.dump(metadata, f, indent=2)
-                
-                # Mark tile as written in database with correct cluster_id
-                self.db.mark_tile_mmap_written(tile_ix, tile_iy, geometry_hash, year, cluster_id)
+                # Mark tile as written in database
+                self.db.mark_tile_stored(tile_ix, tile_iy, geometry_hash, year, cluster_id)
             
-            logger.info(f"✓ Processed and saved {len(tiles)} tiles to MMAP format")
+            # Update next index
+            self.store_metadata["next_index"] = start_idx + len(tiles)
+            self._save_metadata()
+            
+            logger.info(f"✓ Processed and saved {len(tiles)} tiles to Zarr (indices {start_idx} to {start_idx + len(tiles) - 1})")
             
             # Close the image file handle before deleting
             image.close()
             
-            # Delete local file after reprojection
+            # Delete local file after storage
             try:
                 filepath.unlink()
                 logger.info(f"  Deleted local file: {filepath}")
@@ -221,7 +334,7 @@ class ReprojectionWorker:
             
             # Update database - set local_filepath to NULL since file is deleted
             self.db.update_task_status(
-                geometry_hash, year, self.config.STATUS_REPROJECTED,
+                geometry_hash, year, self.config.STATUS_STORED,
                 local_filepath=None
             )
             
@@ -229,12 +342,12 @@ class ReprojectionWorker:
             return True
             
         except Exception as e:
-            logger.error(f"Error reprojecting file: {e}", exc_info=True)
+            logger.error(f"Error storing file: {e}", exc_info=True)
             self.db.increment_worker_counter(self.worker_name, "errors")
             return False
     
     def run(self, continuous: bool = True):
-        """Run the reprojection worker.
+        """Run the storage worker.
         
         Args:
             continuous: If True, run continuously; otherwise run once
@@ -257,9 +370,9 @@ class ReprojectionWorker:
             if downloaded_tasks:
                 logger.info(f"Processing {len(downloaded_tasks)} downloaded tasks")
                 for task in downloaded_tasks:
-                    self.reproject_to_mmap(task)
+                    self.store_to_zarr(task)
             else:
-                logger.debug("No downloaded tasks to reproject")
+                logger.debug("No downloaded tasks to store")
             
             if not continuous:
                 break
@@ -268,3 +381,7 @@ class ReprojectionWorker:
         
         self.db.update_worker_heartbeat(self.worker_name, "stopped")
         logger.info(f"Stopped {self.worker_name} worker")
+
+
+# Deprecated alias for backward compatibility
+ReprojectionWorker = StorageWorker
