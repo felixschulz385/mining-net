@@ -17,7 +17,7 @@ def _get_base_dir():
     
     # Try to import local settings
     try:
-        from local_settings import BASE_DIR as local_base_dir
+        from .local_settings import BASE_DIR as local_base_dir
         return Path(local_base_dir)
     except ImportError:
         pass

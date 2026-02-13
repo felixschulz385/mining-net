@@ -44,9 +44,15 @@ class StatusCheckerWorker:
             True if status updated, False otherwise
         """
         try:
-            geometry_hash = task_data['geometry_hash']
+            cluster_id = task_data['cluster_id']
             year = task_data['year']
-            gee_task_id = task_data['gee_task_id']
+            gee_task_id = task_data.get('gee_task_id')
+            
+            if not gee_task_id:
+                logger.warning(f"No GEE task ID for cluster {cluster_id} year {year}, marking as pending")
+                # Reset to pending so it can be resubmitted
+                self.db.update_task_status(cluster_id, year, self.config.STATUS_PENDING)
+                return False
             
             # Get task status from GEE
             status = ee.data.getTaskStatus(gee_task_id)[0]
@@ -56,7 +62,7 @@ class StatusCheckerWorker:
             if state == 'COMPLETED':
                 logger.info(f"Task {gee_task_id} completed for {task_data['country_code']} {year}")
                 self.db.update_task_status(
-                    geometry_hash, year, self.config.STATUS_COMPLETED
+                    cluster_id, year, self.config.STATUS_COMPLETED
                 )
                 self.db.increment_worker_counter(self.worker_name, "tasks_processed")
                 return True
@@ -65,8 +71,7 @@ class StatusCheckerWorker:
                 error_msg = status.get('error_message', 'Unknown error')
                 logger.error(f"Task {gee_task_id} {state}: {error_msg}")
                 self.db.update_task_status(
-                    geometry_hash, year, self.config.STATUS_FAILED,
-                    error_message=error_msg
+                    cluster_id, year, self.config.STATUS_FAILED
                 )
                 self.db.increment_worker_counter(self.worker_name, "errors")
                 return True
@@ -95,12 +100,11 @@ class StatusCheckerWorker:
         while True:
             self.db.update_worker_heartbeat(self.worker_name, "running")
             
-            # Get submitted tasks
-            submitted_tasks = self.db.get_tasks_by_status(self.config.STATUS_SUBMITTED)
-            
-            # Filter by countries if specified
-            if self.countries and submitted_tasks:
-                submitted_tasks = [t for t in submitted_tasks if t['country_code'] in self.countries]
+            # Get submitted tasks with country filtering
+            submitted_tasks = self.db.get_tasks_by_status(
+                self.config.STATUS_SUBMITTED,
+                countries=self.countries
+            )
             
             if submitted_tasks:
                 logger.info(f"Checking status of {len(submitted_tasks)} tasks")

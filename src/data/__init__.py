@@ -7,7 +7,7 @@ geobox alignment, and zarr storage.
 
 from .config import Config
 from .database import DownloadDatabase
-from .tasks import create_tasks
+from .clustering import create_clusters_and_tiles
 from .janitor import JanitorWorker
 
 __version__ = "0.1.0"
@@ -15,6 +15,6 @@ __version__ = "0.1.0"
 __all__ = [
     'Config',
     'DownloadDatabase',
-    'create_tasks',
+    'create_clusters_and_tiles',
     'JanitorWorker',
 ]

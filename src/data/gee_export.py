@@ -60,7 +60,6 @@ class GEEExportWorker:
             True if successful, False otherwise
         """
         try:
-            geometry_hash = task_data['geometry_hash']
             year = task_data['year']
             country_code = task_data['country_code']
             cluster_id = task_data.get('cluster_id', 0)
@@ -75,10 +74,6 @@ class GEEExportWorker:
             if not tiles:
                 logger.warning(f"No tiles for {country_code} {year}")
                 return False
-            
-            # Store tile information
-            for tile_ix, tile_iy in tiles:
-                self.db.create_tile(tile_ix, tile_iy, geometry_hash, year, cluster_id or 0)
             
             # Use total bounds of all tiles as query region
             tile_geoms = [
@@ -98,16 +93,16 @@ class GEEExportWorker:
             if year_image is None:
                 logger.warning(f"No image for {country_code} {year}")
                 self.db.update_task_status(
-                    geometry_hash, year, self.config.STATUS_FAILED,
-                    error_message=f"No image available for {year}"
+                    cluster_id, year, self.config.STATUS_FAILED
                 )
                 return False
             
             # Clip to ROI
             clipped_image = year_image.clip(roi)
             
-            # Create filename
-            filename = f"LANDSAT_C02_T1_L2_{country_code}_{geometry_hash[:8]}_{year}"
+            # Create filename using cluster_id in hex format
+            cluster_id_hex = format(cluster_id, 'x')[:8]
+            filename = f"LANDSAT_C02_T1_L2_{country_code}_{cluster_id_hex}_{year}"
             
             # Create export task
             task = ee.batch.Export.image.toDrive(
@@ -123,15 +118,13 @@ class GEEExportWorker:
             
             # Start the task
             task.start()
-            task_id = task.id
+            gee_task_id = task.id
             
-            logger.info(f"Submitted task {task_id} for {country_code} {year} ({len(tiles)} tiles)")
+            logger.info(f"Submitted task {gee_task_id} for {country_code} {year} ({len(tiles)} tiles)")
             
-            # Update database
+            # Update database with GEE task ID
             self.db.update_task_status(
-                geometry_hash, year, self.config.STATUS_SUBMITTED,
-                gee_task_id=task_id,
-                gee_task_description=filename
+                cluster_id, year, self.config.STATUS_SUBMITTED, gee_task_id=gee_task_id
             )
             
             self.db.increment_worker_counter(self.worker_name, "tasks_processed")
@@ -140,10 +133,9 @@ class GEEExportWorker:
         except Exception as e:
             logger.error(f"Error submitting task: {e}", exc_info=True)
             self.db.update_task_status(
-                task_data['geometry_hash'], 
+                task_data['cluster_id'], 
                 task_data['year'], 
-                self.config.STATUS_FAILED,
-                error_message=str(e)
+                self.config.STATUS_FAILED
             )
             self.db.increment_worker_counter(self.worker_name, "errors")
             return False
@@ -167,23 +159,23 @@ class GEEExportWorker:
             if num_submitted >= self.config.MAX_SUBMITTED_TASKS:
                 logger.info(f"At maximum submitted tasks limit ({num_submitted}/{self.config.MAX_SUBMITTED_TASKS}), waiting...")
             else:
-                # Get pending tasks, considering the limit
+                # Get available cluster/year combinations from cluster and tiles tables
                 available_slots = self.config.MAX_SUBMITTED_TASKS - num_submitted
                 batch_size = min(self.config.BATCH_SIZE, available_slots)
                 
+                # Get pending tasks with geometry and filtering
                 pending_tasks = self.db.get_tasks_by_status(
-                    self.config.STATUS_PENDING, 
-                    limit=batch_size
+                    self.config.STATUS_PENDING,
+                    limit=batch_size,
+                    countries=self.countries,
+                    include_geometry=True
                 )
-                
-                # Filter by countries if specified
-                if self.countries and pending_tasks:
-                    pending_tasks = [t for t in pending_tasks if t['country_code'] in self.countries]
                 
                 if pending_tasks:
                     logger.info(f"Processing {len(pending_tasks)} pending tasks ({num_submitted}/{self.config.MAX_SUBMITTED_TASKS} submitted)")
-                    for task in pending_tasks:
-                        self.submit_task(task)
+                    
+                    for task_data in pending_tasks:
+                        self.submit_task(task_data)
                         time.sleep(self.TASK_SUBMISSION_DELAY)  # Rate limiting
                 else:
                     logger.debug("No pending tasks")

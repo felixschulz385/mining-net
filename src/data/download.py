@@ -124,6 +124,12 @@ class DownloadWorker:
             True if successful, False otherwise
         """
         try:
+            cluster_id = task_data['cluster_id']
+            year = task_data['year']
+            country_code = task_data['country_code']
+            drive_filename = task_data['drive_filename']
+            local_filepath = Path(task_data['local_filepath'])
+            
             # Find folder
             folder_id = self._find_drive_folder()
             if not folder_id:
@@ -134,38 +140,24 @@ class DownloadWorker:
             files = self._list_drive_files(folder_id)
             
             # Find matching file
-            expected_filename = task_data['gee_task_description']
             matching_file = None
             for file in files:
-                if file['name'].startswith(expected_filename):
+                if file['name'].startswith(drive_filename):
                     matching_file = file
                     break
             
             if not matching_file:
-                # Track how many times this file wasn't found
-                task_key = (task_data['geometry_hash'], task_data['year'])
-                self.file_not_found_count[task_key] = self.file_not_found_count.get(task_key, 0) + 1
-                
-                attempts = self.file_not_found_count[task_key]
-                
-                if attempts >= self.MAX_FILE_NOT_FOUND_ATTEMPTS:
-                    logger.warning(
-                        f"File not found after {attempts} attempts: {expected_filename}. "
-                        f"Resetting task to pending for re-export."
-                    )
-                    # Reset task to pending so it can be re-exported
-                    self.db.update_task_status(
-                        task_data['geometry_hash'],
-                        task_data['year'],
-                        self.config.STATUS_PENDING,
-                        error_message=f"File not found on Drive after {attempts} attempts"
-                    )
-                    # Clear the counter
-                    del self.file_not_found_count[task_key]
-                    return False
-                else:
-                    logger.debug(f"File not yet available ({attempts}/{self.MAX_FILE_NOT_FOUND_ATTEMPTS}): {expected_filename}")
-                    return False
+                # File not found on Drive - demote to pending for status checker to verify
+                logger.warning(
+                    f"File not found on Drive: {drive_filename}. "
+                    f"Demoting task from COMPLETED to PENDING to verify GEE status."
+                )
+                self.db.update_task_status(
+                    task_data['cluster_id'],
+                    task_data['year'],
+                    self.config.STATUS_PENDING
+                )
+                return False
             
             file_id = matching_file['id']
             filename = matching_file['name']
@@ -174,8 +166,8 @@ class DownloadWorker:
             if not filename.endswith('.tif'):
                 filename += '.tif'
             
-            # Download path
-            filepath = self.config.DOWNLOAD_DIR / filename
+            # Use pre-computed filepath
+            filepath = local_filepath
             
             # Download file
             logger.info(f"Downloading {filename}")
@@ -203,16 +195,13 @@ class DownloadWorker:
             
             # Update database
             self.db.update_task_status(
-                task_data['geometry_hash'],
+                task_data['cluster_id'],
                 task_data['year'],
-                self.config.STATUS_DOWNLOADED,
-                drive_file_id=file_id,
-                drive_filename=filename,
-                local_filepath=str(filepath)
+                self.config.STATUS_DOWNLOADED
             )
             
             # Clear not-found counter on success
-            task_key = (task_data['geometry_hash'], task_data['year'])
+            task_key = (cluster_id, year)
             if task_key in self.file_not_found_count:
                 del self.file_not_found_count[task_key]
             
@@ -236,14 +225,15 @@ class DownloadWorker:
             self.db.update_worker_heartbeat(self.worker_name, "running")
             
             # Get completed tasks
-            completed_tasks = self.db.get_tasks_by_status(
+            completed_tasks_data = self.db.get_tasks_by_status(
                 self.config.STATUS_COMPLETED,
-                limit=self.config.BATCH_SIZE
+                limit=self.config.BATCH_SIZE,
+                include_filenames=True
             )
             
-            if completed_tasks:
-                logger.info(f"Processing {len(completed_tasks)} completed tasks")
-                for task in completed_tasks:
+            if completed_tasks_data:
+                logger.info(f"Processing {len(completed_tasks_data)} completed tasks")
+                for task in completed_tasks_data:
                     self.download_file(task)
                     time.sleep(1)  # Rate limiting
             else:

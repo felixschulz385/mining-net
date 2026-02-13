@@ -1,11 +1,40 @@
 """Configuration for mining segmentation downloader."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
+from ..config import Config as BaseConfig
 
-class Config:
+
+def _get_base_dir():
+    """Get base directory from environment variable or local settings.
+    
+    Device-specific paths should not be committed to git.
+    """
+    # Try environment variable first
+    env_path = os.getenv('MINING_NET_BASE_DIR')
+    if env_path:
+        return Path(env_path)
+    
+    # Try to import local settings (one directory up from src/data/)
+    try:
+        from ..local_settings import BASE_DIR as local_base_dir
+        return Path(local_base_dir)
+    except ImportError:
+        pass
+    
+    # Fallback for HPC/scicore
+    return Path("/scicore/home/meiera/schulz0022/projects/mining-net")
+
+
+class Config(BaseConfig):
     """Configuration settings."""
+    
+    # Override BASE_DIR with data-specific logic
+    BASE_DIR = _get_base_dir()
+    DATA_DIR = BASE_DIR / "data"
+    DB_PATH = DATA_DIR / "mining_segmentation.db"
     
     # Google Earth Engine
     GEE_PROJECT = "ee-growthandheat"
@@ -18,12 +47,9 @@ class Config:
     DRIVE_FOLDER = "landsat_mining"
     DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive']
     
-    # Local paths
-    BASE_DIR = Path("/scicore/home/meiera/schulz0022/projects/mining-net")
-    DATA_DIR = BASE_DIR / "data"
+    # Local paths (device-specific, respects environment and local_settings.py)
     DOWNLOAD_DIR = DATA_DIR / "downloads"
     ARCHIVE_DIR = DATA_DIR / "archives"
-    DB_PATH = DATA_DIR / "mining_segmentation.db"
     MINING_FILE = DATA_DIR / "global_mining_polygons_v2.gpkg"  # Path to mining polygons GeoPackage
     CREDENTIALS_FILE = BASE_DIR / "secrets" / "client_secret.json"
     TOKEN_FILE = BASE_DIR / "secrets" / "token.pickle"
@@ -51,6 +77,9 @@ class Config:
     WORLD_GEOBOX_RESOLUTION = 0.000269495  # ~30m at equator
     WORLD_GEOBOX_TILE_SIZE = [64, 64]  # tiles per dimension
     
+    # Ground truth year - only this year has labels
+    GROUND_TRUTH_YEAR = 2019  # Year with available ground truth labels
+    
     # Task status constants
     STATUS_PENDING = "pending"
     STATUS_SUBMITTED = "submitted"
@@ -67,6 +96,6 @@ class Config:
     @classmethod
     def ensure_dirs(cls):
         """Ensure all required directories exist."""
-        cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        super().ensure_dirs()
         cls.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         cls.ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)

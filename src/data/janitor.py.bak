@@ -1,0 +1,1146 @@
+"""Janitor worker to verify filesystem integrity and sync with database.
+
+The Janitor worker performs periodic integrity checks to ensure the database
+state matches the actual filesystem state. It can run in two modes:
+
+1. CHECK mode (clean=False): Reports issues without making changes
+2. CLEAN mode (clean=True): Fixes inconsistencies automatically
+
+Workflow:
+---------
+1. Database Integrity Checks:
+   - For STORED tasks: Verify Zarr directories exist and are complete
+   - For DOWNLOADED tasks: Verify local files exist in download directory
+   - For COMPLETED tasks: Verify files exist on Google Drive
+
+2. Reverse Integrity Checks:
+   - Upgrade tasks that have files but are marked with lower status
+
+3. Orphan Detection:
+   - Zarr Orphans: Find cluster/year directories not in database
+   - Download Orphans: Find local .tif files not referenced in database
+
+4. Tile Integrity:
+   - Compare Zarr tile subdirectories with tiles table entries
+   - Verify tile coordinates match exactly (tile_ix, tile_iy)
+"""
+
+import time
+import logging
+import pickle
+import shutil
+from pathlib import Path
+from typing import Optional, List, Set, Tuple, Dict
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
+from .database import DownloadDatabase
+from .config import Config
+
+logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Data Classes
+# ==============================================================================
+
+@dataclass
+class TaskIssue:
+    """Represents an issue found with a task."""
+    geometry_hash: str
+    year: int
+    country_code: str
+    cluster_id: Optional[int]
+    issue: str
+    new_status: Optional[str]
+    current_status: str = ""
+    
+    def __str__(self) -> str:
+        return f"{self.country_code} {self.year} (cluster {self.cluster_id}): {self.issue}"
+
+
+@dataclass
+class CheckResult:
+    """Result of an integrity check."""
+    issues_found: int = 0
+    issues_fixed: int = 0
+    issues: List[TaskIssue] = field(default_factory=list)
+    
+    def add_issue(self, issue: TaskIssue):
+        """Add an issue to the result."""
+        self.issues.append(issue)
+        self.issues_found += 1
+    
+    def increment_fixed(self):
+        """Increment the fixed counter."""
+        self.issues_fixed += 1
+
+
+class FileSystemState:
+    """Cached filesystem state to avoid repeated API calls."""
+    
+    def __init__(self):
+        self.drive_files: Optional[Set[str]] = None
+        self.zarr_clusters: Optional[Dict[int, Set[int]]] = None
+
+
+# ==============================================================================
+# Main Worker Class
+# ==============================================================================
+
+class JanitorWorker:
+    """Worker to verify filesystem integrity and keep database synchronized."""
+    
+    def __init__(
+        self, 
+        db: DownloadDatabase, 
+        config: Optional[Config] = None,
+        countries: Optional[List[str]] = None,
+        clean: bool = False
+    ):
+        """Initialize janitor worker.
+        
+        Args:
+            db: Database instance
+            config: Configuration instance
+            countries: Optional list of ISO3 country codes to filter tasks
+            clean: If True, remove orphaned files and fix inconsistencies
+        """
+        self.db = db
+        self.config = config or Config()
+        self.countries = countries
+        self.clean = clean
+        self.worker_name = "janitor"
+        self.drive_service = None
+        self.fs_state = FileSystemState()
+        
+        mode = "CLEAN" if self.clean else "CHECK"
+        logger.info(f"Janitor running in {mode} mode")
+        
+        # Initialize Google Drive API
+        try:
+            self._authenticate_drive()
+            logger.info("Initialized Google Drive API")
+        except Exception as e:
+            logger.warning(f"Could not initialize Drive API: {e}")
+            self.drive_service = None
+    
+    # ==========================================================================
+    # Authentication & Drive API
+    # ==========================================================================
+    
+    def _authenticate_drive(self):
+        """Authenticate with Google Drive."""
+        creds = self._load_or_refresh_credentials()
+        self.drive_service = build('drive', 'v3', credentials=creds)
+    
+    def _load_or_refresh_credentials(self):
+        """Load existing credentials or obtain new ones."""
+        creds = None
+        
+        if self.config.TOKEN_FILE.exists():
+            with open(self.config.TOKEN_FILE, 'rb') as token:
+                creds = pickle.load(token)
+        
+        if not creds or not creds.valid:
+            creds = self._refresh_or_obtain_credentials(creds)
+            self._save_credentials(creds)
+        
+        return creds
+    
+    def _refresh_or_obtain_credentials(self, creds):
+        """Refresh expired credentials or obtain new ones."""
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            creds = self._obtain_new_credentials()
+        return creds
+    
+    def _obtain_new_credentials(self):
+        """Obtain new credentials via OAuth flow."""
+        if not self.config.CREDENTIALS_FILE.exists():
+            raise FileNotFoundError(
+                f"Credentials file not found: {self.config.CREDENTIALS_FILE}"
+            )
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(self.config.CREDENTIALS_FILE), 
+            self.config.DRIVE_SCOPES
+        )
+        return flow.run_local_server(port=0)
+    
+    def _save_credentials(self, creds):
+        """Save credentials to token file."""
+        with open(self.config.TOKEN_FILE, 'wb') as token:
+            pickle.dump(creds, token)
+    
+    # ==========================================================================
+    # Filesystem State Queries (with caching)
+    # ==========================================================================
+    
+    def _get_drive_files(self, use_cache: bool = True) -> Set[str]:
+        """Get set of files on Google Drive.
+        
+        Args:
+            use_cache: If True, return cached result if available
+            
+        Returns:
+            Set of filenames (without .tif extension)
+        """
+        if use_cache and self.fs_state.drive_files is not None:
+            return self.fs_state.drive_files
+        
+        if not self.drive_service:
+            return set()
+        
+        try:
+            folder_id = self._find_drive_folder_id()
+            if not folder_id:
+                return set()
+            
+            files = self._list_files_in_drive_folder(folder_id)
+            drive_files = self._extract_task_descriptions(files)
+            
+            self.fs_state.drive_files = drive_files
+            return drive_files
+            
+        except Exception as e:
+            logger.error(f"Error listing Drive files: {e}")
+            return set()
+    
+    def _find_drive_folder_id(self) -> Optional[str]:
+        """Find the Drive folder ID."""
+        query = (
+            f"name='{self.config.DRIVE_FOLDER}' and "
+            "mimeType='application/vnd.google-apps.folder' and trashed=false"
+        )
+        results = self.drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name)',
+            pageSize=10
+        ).execute()
+        
+        folders = results.get('files', [])
+        if not folders:
+            logger.warning(f"Drive folder '{self.config.DRIVE_FOLDER}' not found")
+            return None
+        
+        return folders[0]['id']
+    
+    def _list_files_in_drive_folder(self, folder_id: str) -> List[Dict]:
+        """List all files in a Drive folder."""
+        query = f"'{folder_id}' in parents and trashed=false"
+        results = self.drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name)',
+            pageSize=1000
+        ).execute()
+        return results.get('files', [])
+    
+    def _extract_task_descriptions(self, files: List[Dict]) -> Set[str]:
+        """Extract task descriptions from file list (removing .tif extension)."""
+        drive_files = set()
+        for file in files:
+            name = file['name']
+            if name.endswith('.tif'):
+                name = name[:-4]
+            drive_files.add(name)
+        return drive_files
+    
+    def _get_zarr_clusters(self, use_cache: bool = True) -> Dict[int, Set[int]]:
+        """Get clusters and years in Zarr directory.
+        
+        Args:
+            use_cache: If True, return cached result if available
+            
+        Returns:
+            Dict mapping cluster_id -> set of years
+        """
+        if use_cache and self.fs_state.zarr_clusters is not None:
+            return self.fs_state.zarr_clusters
+        
+        zarr_path = self.config.DATA_DIR / "landsat_zarr"
+        
+        # Try index arrays first, fallback to directory scan
+        clusters = self._read_zarr_from_index_arrays(zarr_path)
+        if not clusters:
+            clusters = self._read_zarr_from_directory(zarr_path)
+        
+        self.fs_state.zarr_clusters = clusters
+        return clusters
+    
+    def _read_zarr_from_index_arrays(self, zarr_path: Path) -> Dict[int, Set[int]]:
+        """Read Zarr clusters from global index arrays (new format)."""
+        clusters = defaultdict(set)
+        
+        try:
+            import zarr
+            store_path = zarr_path / "data.zarr"
+            if not store_path.exists():
+                return clusters
+            
+            zarr_group = zarr.open_group(store=str(store_path), mode='r')
+            
+            if 'cluster_ids' not in zarr_group or 'years' not in zarr_group:
+                return clusters
+            
+            cluster_ids_array = zarr_group['cluster_ids'][:]
+            years_array = zarr_group['years'][:]
+            
+            for idx in range(len(cluster_ids_array)):
+                cluster_id = int(cluster_ids_array[idx])
+                year = int(years_array[idx])
+                clusters[cluster_id].add(year)
+            
+            return clusters
+        except Exception as e:
+            logger.debug(f"Could not read Zarr index arrays: {e}")
+            return clusters
+    
+    def _read_zarr_from_directory(self, zarr_path: Path) -> Dict[int, Set[int]]:
+        """Read Zarr clusters by scanning directory structure."""
+        clusters = defaultdict(set)
+        
+        if not zarr_path.exists():
+            return clusters
+        
+        for cluster_dir in zarr_path.iterdir():
+            if not cluster_dir.is_dir() or cluster_dir.name == "data.zarr":
+                continue
+            
+            try:
+                cluster_id = int(cluster_dir.name)
+                for year_dir in cluster_dir.iterdir():
+                    if year_dir.is_dir():
+                        try:
+                            year = int(year_dir.name)
+                            clusters[cluster_id].add(year)
+                        except ValueError:
+                            pass
+            except ValueError:
+                pass
+        
+        total = sum(len(years) for years in clusters.values())
+        logger.info(f"Found {len(clusters)} clusters with {total} years (from scan)")
+        return clusters
+    
+    # ==========================================================================
+    
+    def _get_zarr_tile_coords(self, cluster_id: int, year: int) -> Set[Tuple[int, int]]:
+        """Get actual tile coordinates in Zarr.
+        
+        Args:
+            cluster_id: Cluster ID
+            year: Year
+            
+        Returns:
+            Set of (tile_ix, tile_iy) tuples
+        """
+        # Try index arrays first
+        tiles = self._read_tiles_from_index_arrays(cluster_id, year)
+        if tiles:
+            return tiles
+        
+        # Fallback to directory scan
+        return self._read_tiles_from_directory(cluster_id, year)
+    
+    def _read_tiles_from_index_arrays(
+        self, cluster_id: int, year: int
+    ) -> Set[Tuple[int, int]]:
+        """Read tile coordinates from global Zarr index arrays."""
+        tiles = set()
+        
+        try:
+            import zarr
+            store_path = self.config.DATA_DIR / "landsat_zarr" / "data.zarr"
+            if not store_path.exists():
+                return tiles
+            
+            zarr_group = zarr.open_group(store=str(store_path), mode='r')
+            
+            required = ['cluster_ids', 'tile_ix', 'tile_iy', 'years']
+            if not all(arr in zarr_group for arr in required):
+                return tiles
+            
+            cluster_ids = zarr_group['cluster_ids'][:]
+            tile_ix = zarr_group['tile_ix'][:]
+            tile_iy = zarr_group['tile_iy'][:]
+            years = zarr_group['years'][:]
+            
+            # Find tiles for this cluster/year
+            for idx in range(len(cluster_ids)):
+                if cluster_ids[idx] == cluster_id and years[idx] == year:
+                    tiles.add((int(tile_ix[idx]), int(tile_iy[idx])))
+            
+            return tiles
+        except Exception as e:
+            logger.debug(f"Could not read tile index arrays: {e}")
+            return tiles
+    
+    def _read_tiles_from_directory(
+        self, cluster_id: int, year: int
+    ) -> Set[Tuple[int, int]]:
+        """Read tile coordinates by scanning directory structure."""
+        tiles = set()
+        zarr_path = self.config.DATA_DIR / "landsat_zarr" / str(cluster_id) / str(year)
+        
+        if not zarr_path.exists():
+            return tiles
+        
+        for tile_dir in zarr_path.iterdir():
+            if tile_dir.is_dir() and '_' in tile_dir.name:
+                coords = self._parse_tile_directory_name(tile_dir.name)
+                if coords:
+                    tiles.add(coords)
+        
+        return tiles
+    
+    def _parse_tile_directory_name(self, name: str) -> Optional[Tuple[int, int]]:
+        """Parse tile directory name to extract coordinates."""
+        try:
+            parts = name.split('_')
+            if len(parts) == 2:
+                tile_ix = int(parts[0])
+                tile_iy = int(parts[1])
+                return (tile_ix, tile_iy)
+        except (ValueError, IndexError):
+            pass
+        return None
+    
+    def check_zarr_index_integrity(self) -> bool:
+        """Verify that Zarr group has all required index arrays."""
+        try:
+            import zarr
+            store_path = self.config.DATA_DIR / "landsat_zarr" / "data.zarr"
+            
+            if not store_path.exists():
+                logger.debug("No Zarr store found")
+                return True
+            
+            zarr_group = zarr.open_group(store=str(store_path), mode='r')
+            
+            required_arrays = ['features', 'labels', 'cluster_ids', 'tile_ix', 'tile_iy', 'years']
+            missing = [arr for arr in required_arrays if arr not in zarr_group]
+            
+            if missing:
+                logger.warning(f"Zarr store missing index arrays: {missing}")
+                return False
+            
+            # Verify array sizes match
+            sizes = {
+                'features': zarr_group['features'].shape[0],
+                'labels': zarr_group['labels'].shape[0],
+                'cluster_ids': len(zarr_group['cluster_ids']),
+                'tile_ix': len(zarr_group['tile_ix']),
+                'tile_iy': len(zarr_group['tile_iy']),
+                'years': len(zarr_group['years'])
+            }
+            
+            if len(set(sizes.values())) != 1:
+                logger.warning(f"Zarr array size mismatch: {sizes}")
+                return False
+            
+            logger.debug(f"Zarr store valid ({sizes['features']} tiles)")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error checking Zarr index integrity: {e}")
+            return False
+    
+    # ==========================================================================
+    # Task Checking Logic
+    # ==========================================================================
+    
+    def _check_stored_task(
+        self, task: Dict, zarr_clusters: Dict[int, Set[int]]
+    ) -> Optional[TaskIssue]:
+        """Check a task with STORED status."""
+        cluster_id = task['cluster_id']
+        year = task['year']
+        country_code = task['country_code']
+        
+        if cluster_id is None:
+            return TaskIssue(
+                geometry_hash=str(cluster_id),
+                year=year,
+                country_code=country_code,
+                cluster_id=cluster_id,
+                issue="No cluster_id",
+                new_status=self.config.STATUS_PENDING
+            )
+        
+        if cluster_id not in zarr_clusters or year not in zarr_clusters[cluster_id]:
+            fallback_status = self._determine_fallback_status(task)
+            return TaskIssue(
+                geometry_hash=str(cluster_id),
+                year=year,
+                country_code=country_code,
+                cluster_id=cluster_id,
+                issue="Zarr cluster/year missing",
+                new_status=fallback_status
+            )
+        
+        # Check tiles match
+        return self._verify_zarr_tiles(task, zarr_clusters)
+    
+    def _verify_zarr_tiles(
+        self, task: Dict, zarr_clusters: Dict[int, Set[int]]
+    ) -> Optional[TaskIssue]:
+        """Verify that Zarr tiles match database tiles."""
+        cluster_id = task['cluster_id']
+        year = task['year']
+        country_code = task['country_code']
+        
+        db_tiles = self.db.get_tiles_for_cluster(cluster_id)
+        expected_coords = {(t['tile_ix'], t['tile_iy']) for t in db_tiles}
+        
+        if not expected_coords:
+            return TaskIssue(
+                geometry_hash=str(cluster_id),
+                year=year,
+                country_code=country_code,
+                cluster_id=cluster_id,
+                issue="No tiles in database",
+                new_status=self.config.STATUS_PENDING
+            )
+        
+        actual_coords = self._get_zarr_tile_coords(cluster_id, year)
+        
+        if not actual_coords:
+            fallback_status = self._determine_fallback_status(task)
+            return TaskIssue(
+                geometry_hash=str(cluster_id),
+                year=year,
+                country_code=country_code,
+                cluster_id=cluster_id,
+                issue="No tiles in Zarr directory",
+                new_status=fallback_status
+            )
+        
+        if actual_coords != expected_coords:
+            missing = expected_coords - actual_coords
+            extra = actual_coords - expected_coords
+            issue_parts = [f"Tile mismatch (expected {len(expected_coords)}, found {len(actual_coords)})"]
+            if missing:
+                issue_parts.append(f"missing {len(missing)} tiles")
+            if extra:
+                issue_parts.append(f"{len(extra)} extra tiles")
+            
+            fallback_status = self._determine_fallback_status(task)
+            return TaskIssue(
+                geometry_hash=str(cluster_id),
+                year=year,
+                country_code=country_code,
+                cluster_id=cluster_id,
+                issue=", ".join(issue_parts),
+                new_status=fallback_status
+            )
+        
+        return None
+    
+    def _check_downloaded_task(
+        self, task: Dict, drive_files: Set[str]
+    ) -> Optional[TaskIssue]:
+        """Check a task with DOWNLOADED status."""
+        cluster_id = task['cluster_id']
+        year = task['year']
+        country_code = task['country_code']
+        local_filepath = task.get('local_filepath')
+        
+        if not local_filepath or not Path(local_filepath).exists():
+            # Compute expected filename to check if on Drive
+            cluster_id_hex = format(cluster_id, 'x')[:8]
+            task_desc = f"LANDSAT_C02_T1_L2_{country_code}_{cluster_id_hex}_{year}"
+            new_status = (
+                self.config.STATUS_COMPLETED
+                if task_desc in drive_files
+                else self.config.STATUS_PENDING
+            )
+            
+            return TaskIssue(
+                geometry_hash=str(cluster_id),
+                year=year,
+                country_code=country_code,
+                cluster_id=cluster_id,
+                issue="Downloaded file missing",
+                new_status=new_status
+            )
+        
+        return None
+    
+    def _check_completed_task(
+        self, task: Dict, drive_files: Set[str]
+    ) -> Optional[TaskIssue]:
+        """Check a task with COMPLETED status."""
+        cluster_id = task['cluster_id']
+        year = task['year']
+        country_code = task['country_code']
+        
+        # Compute expected filename
+        cluster_id_hex = format(cluster_id, 'x')[:8]
+        task_desc = f"LANDSAT_C02_T1_L2_{country_code}_{cluster_id_hex}_{year}"
+        
+        if task_desc not in drive_files:
+            return TaskIssue(
+                geometry_hash=str(cluster_id),
+                year=year,
+                country_code=country_code,
+                cluster_id=cluster_id,
+                issue="File not on Drive",
+                new_status=self.config.STATUS_PENDING
+            )
+        
+        return None
+    
+    def _determine_fallback_status(self, task: Dict) -> str:
+        """Determine fallback status when Zarr is invalid."""
+        local_filepath = task.get('local_filepath')
+        if local_filepath and Path(local_filepath).exists():
+            return self.config.STATUS_DOWNLOADED
+        return self.config.STATUS_PENDING
+    
+    # ==========================================================================
+    # Database Integrity Check
+    # ==========================================================================
+    
+    def check_database_integrity(self) -> Tuple[int, int]:
+        """Check database tasks against filesystem and fix inconsistencies."""
+        drive_files = self._get_drive_files()
+        zarr_clusters = self._get_zarr_clusters()
+        
+        statuses_to_check = [
+            self.config.STATUS_STORED,
+            self.config.STATUS_DOWNLOADED,
+            self.config.STATUS_COMPLETED
+        ]
+        
+        issues_by_status = {}
+        
+        for status in statuses_to_check:
+            tasks = self._get_tasks_by_status_filtered(status)
+            issues = []
+            
+            for task in tasks:
+                issue = None
+                
+                if status == self.config.STATUS_STORED:
+                    issue = self._check_stored_task(task, zarr_clusters)
+                elif status == self.config.STATUS_DOWNLOADED:
+                    issue = self._check_downloaded_task(task, drive_files)
+                elif status == self.config.STATUS_COMPLETED:
+                    issue = self._check_completed_task(task, drive_files)
+                
+                if issue:
+                    issues.append(issue)
+            
+            issues_by_status[status] = {'total': len(tasks), 'issues': issues}
+        
+        # Report and fix
+        self._log_database_integrity_report(issues_by_status, statuses_to_check)
+        issues_fixed = self._fix_database_issues(issues_by_status)
+        
+        issues_found = sum(len(info['issues']) for info in issues_by_status.values())
+        return issues_found, issues_fixed
+    
+    def _get_tasks_by_status_filtered(self, status: str) -> List[Dict]:
+        """Get tasks by status, optionally filtered by countries."""
+        clusters = self.db.get_clusters_by_status(status, limit=None)
+        
+        # Convert to task format for compatibility
+        tasks = []
+        for cluster in clusters:
+            cluster_id = cluster['cluster_id']
+            year = cluster['year']
+            country_code = cluster['country_code']
+            
+            task = {
+                'geometry_hash': str(cluster_id),  # For compatibility
+                'cluster_id': cluster_id,
+                'year': year,
+                'country_code': country_code,
+                'status': cluster['status']
+            }
+            tasks.append(task)
+        
+        if self.countries:
+            tasks = [t for t in tasks if t['country_code'] in self.countries]
+        return tasks
+    
+    def _log_database_integrity_report(
+        self, issues_by_status: Dict, statuses: List[str]
+    ):
+        """Log database integrity check report."""
+        logger.info("=== Database Integrity Check Report ===")
+        
+        # Only log if there are issues
+        total_issues = sum(len(info['issues']) for info in issues_by_status.values())
+        if total_issues == 0:
+            return
+        
+        logger.info("=== Database Integrity Issues ===")
+        
+        # Detailed issues only_by_status[status]
+        for status, info in issues_by_status.items():
+            if not info['issues']:
+                continue
+            
+            logger.info(f"\n{status}: {len(info['issues'])} issues found")
+            self._log_grouped_issues(info['issues'])
+    
+    def _log_grouped_issues(self, issues: List[TaskIssue]):
+        """Log issues grouped by issue type."""
+        issues_by_type = defaultdict(list)
+        for issue in issues:
+            issues_by_type[issue.issue].append(issue)
+        
+        for issue_type, issue_list in issues_by_type.items():
+            logger.warning(f"  {issue_type}: {len(issue_list)} tasks")
+            # Show first 5 examples
+            for issue in issue_list[:5]:
+                logger.warning(f"    - {issue}")
+            if len(issue_list) > 5:
+                logger.warning(f"    ... and {len(issue_list) - 5} more")
+    
+    def _fix_database_issues(self, issues_by_status: Dict) -> int:
+        """Fix database issues if in clean mode."""
+        if not self.clean:
+            return 0
+        
+        issues_fixed = 0
+        
+        for status, info in issues_by_status.items():
+            for issue in info['issues']:
+                if issue.new_status:
+                    # Remove incomplete Zarr if needed
+                    if status == self.config.STATUS_STORED and 'mismatch' in issue.issue.lower():
+                        self._remove_zarr_directory(issue.cluster_id, issue.year)
+                    
+                    self.db.update_cluster_status(
+                        issue.cluster_id,
+                        issue.year,
+                        issue.new_status
+                    )
+                    issues_fixed += 1
+        
+        return issues_fixed
+    
+    def _remove_zarr_directory(self, cluster_id: int, year: int):
+        """Remove Zarr directory for cluster/year."""
+        zarr_dir = self.config.DATA_DIR / "landsat_zarr" / str(cluster_id) / str(year)
+        if zarr_dir.exists():
+            shutil.rmtree(zarr_dir)
+    
+    # ==========================================================================
+    # Reverse Integrity Check
+    # ==========================================================================
+    
+    def check_reverse_integrity(self) -> Tuple[int, int]:
+        """Check if tasks have correct status based on what files actually exist."""
+        drive_files = self._get_drive_files()
+        zarr_clusters = self._get_zarr_clusters()
+        
+        tasks = self._get_non_stored_tasks()
+        
+        upgrade_list = []
+        for task in tasks:
+            upgrade = self._check_task_for_upgrade(task, drive_files, zarr_clusters)
+            if upgrade:
+                upgrade_list.append(upgrade)
+        
+        if upgrade_list:
+            self._log_reverse_integrity_report(upgrade_list)
+            issues_fixed = self._fix_reverse_integrity_issues(upgrade_list)
+        else:
+            issues_fixed = 0
+        
+        return len(upgrade_list), issues_fixed
+    
+    def _get_non_stored_tasks(self) -> List[Dict]:
+        """Get all tasks except those with STORED status."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT geometry_hash, year, status, cluster_id, country_code, 
+                       gee_task_description, local_filepath
+                FROM tasks
+                WHERE status != ?
+            """, (self.config.STATUS_STORED,))
+            tasks = cursor.fetchall()
+        
+        if self.countries:
+            tasks = [t for t in tasks if t['country_code'] in self.countries]
+        
+        return tasks
+    
+    def _check_task_for_upgrade(
+        self, task: Dict, drive_files: Set[str], zarr_clusters: Dict[int, Set[int]]
+    ) -> Optional[Dict]:
+        """Check if task should be upgraded to higher status."""
+        cluster_id = task['cluster_id']
+        year = task['year']
+        current_status = task['status']
+        country_code = task['country_code']
+        
+        # Compute expected filename
+        cluster_id_hex = format(cluster_id, 'x')[:8]
+        task_desc = f"LANDSAT_C02_T1_L2_{country_code}_{cluster_id_hex}_{year}"
+        
+        # Compute local filepath
+        from pathlib import Path
+        local_filepath = self.config.DOWNLOAD_DIR / f"{task_desc}.tif"
+        
+        # Check for STORED
+        if cluster_id and cluster_id in zarr_clusters and year in zarr_clusters[cluster_id]:
+            db_tiles = self.db.get_tiles_for_cluster(cluster_id)
+            if db_tiles:
+                expected_coords = {(t['tile_ix'], t['tile_iy']) for t in db_tiles}
+                actual_coords = self._get_zarr_tile_coords(cluster_id, year)
+                
+                if expected_coords and actual_coords == expected_coords:
+                    if current_status != self.config.STATUS_STORED:
+                        return {
+                            'geometry_hash': str(cluster_id),
+                            'year': year,
+                            'country': country_code,
+                            'cluster_id': cluster_id,
+                            'current_status': current_status,
+                            'should_be_status': self.config.STATUS_STORED,
+                            'reason': f"Zarr exists with {len(actual_coords)} valid tiles"
+                        }
+        
+        # Check for DOWNLOADED
+        if local_filepath and Path(local_filepath).exists():
+            if current_status in [
+                self.config.STATUS_PENDING,
+                self.config.STATUS_SUBMITTED,
+                self.config.STATUS_COMPLETED
+            ]:
+                return {
+                    'geometry_hash': str(cluster_id),
+                    'year': year,
+                    'country': country_code,
+                    'cluster_id': cluster_id,
+                    'current_status': current_status,
+                    'should_be_status': self.config.STATUS_DOWNLOADED,
+                    'reason': "Local file exists"
+                }
+        
+        # Check for COMPLETED
+        if task_desc and task_desc in drive_files:
+            if current_status in [self.config.STATUS_PENDING, self.config.STATUS_SUBMITTED]:
+                return {
+                    'geometry_hash': str(cluster_id),
+                    'year': year,
+                    'country': country_code,
+                    'cluster_id': cluster_id,
+                    'current_status': current_status,
+                    'should_be_status': self.config.STATUS_COMPLETED,
+                    'reason': "File exists on Drive"
+                }
+        
+        return None
+    
+    def _log_reverse_integrity_report(self, upgrade_list: List[Dict]):
+        """Log reverse integrity check report."""
+        logger.info(f"\n=== Reverse Integrity Check (Status Upgrades) ===")
+        logger.info(f"Found {len(upgrade_list)} tasks with incorrect (too low) status")
+        
+        # Group by status transition
+        transitions = defaultdict(list)
+        for item in upgrade_list:
+            key = f"{item['current_status']} -> {item['should_be_status']}"
+            transitions[key].append(item)
+        
+        for transition, items in transitions.items():
+            logger.warning(f"  {transition}: {len(items)} tasks")
+            for item in items[:5]:
+                logger.warning(
+                    f"    - {item['country']} {item['year']} "
+                    f"(cluster {item['cluster_id']}): {item['reason']}"
+                )
+            if len(items) > 5:
+                logger.warning(f"    ... and {len(items) - 5} more")
+    
+    def _fix_reverse_integrity_issues(self, upgrade_list: List[Dict]) -> int:
+        """Fix reverse integrity issues if in clean mode."""
+        if not self.clean:
+            return 0
+        
+        for item in upgrade_list:
+            self.db.update_cluster_status(
+                item['cluster_id'],
+                item['year'],
+                item['should_be_status']
+            )
+        
+        logger.info(f"Upgraded: {len(upgrade_list)} tasks")
+        return len(upgrade_list)
+    
+    # ==========================================================================
+    # Orphan Checks
+    # ==========================================================================
+    
+    def check_orphaned_zarr(self) -> Tuple[int, int]:
+        """Check for Zarr directories not in database."""
+        zarr_path = self.config.DATA_DIR / "landsat_zarr"
+        
+        if not zarr_path.exists():
+            return 0, 0
+        
+        db_clusters = self._get_database_clusters()
+        orphan_list = self._find_orphaned_zarr_directories(zarr_path, db_clusters)
+        
+        if orphan_list:
+            self._log_orphaned_zarr_report(orphan_list)
+            orphans_removed = self._remove_orphaned_zarr(orphan_list, zarr_path)
+        else:
+            orphans_removed = 0
+        
+        return len(orphan_list), orphans_removed
+    
+    def _get_database_clusters(self) -> Set[Tuple[int, int]]:
+        """Get all cluster/year pairs from database."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT cluster_id, year 
+                FROM tasks 
+                WHERE cluster_id IS NOT NULL
+            """)
+            return {(row['cluster_id'], row['year']) for row in cursor.fetchall()}
+    
+    def _find_orphaned_zarr_directories(
+        self, zarr_path: Path, db_clusters: Set[Tuple[int, int]]
+    ) -> List[Tuple[int, int, Path]]:
+        """Find Zarr directories not in database."""
+        orphan_list = []
+        
+        for cluster_dir in zarr_path.iterdir():
+            if not cluster_dir.is_dir() or cluster_dir.name == "data.zarr":
+                continue
+            
+            try:
+                cluster_id = int(cluster_dir.name)
+            except ValueError:
+                continue
+            
+            for year_dir in cluster_dir.iterdir():
+                if not year_dir.is_dir():
+                    continue
+                
+                try:
+                    year = int(year_dir.name)
+                except ValueError:
+                    continue
+                
+                if (cluster_id, year) not in db_clusters:
+                    orphan_list.append((cluster_id, year, year_dir))
+        
+        return orphan_list
+    
+    def _log_orphaned_zarr_report(self, orphan_list: List[Tuple[int, int, Path]]):
+        """Log orphaned Zarr directories report."""
+        logger.info(f"\n=== Orphaned Zarr Directories ===")
+        logger.info(f"Found {len(orphan_list)} orphaned cluster/year directories")
+        
+        for cluster_id, year, _ in orphan_list:
+            logger.warning(f"  Cluster {cluster_id}, year {year}")
+    
+    def _remove_orphaned_zarr(
+        self, orphan_list: List[Tuple[int, int, Path]], zarr_path: Path
+    ) -> int:
+        """Remove orphaned Zarr directories if in clean mode."""
+        if not self.clean:
+            return 0
+        
+        for _, _, year_dir in orphan_list:
+            shutil.rmtree(year_dir)
+        
+        # Remove empty cluster directories
+        for cluster_dir in zarr_path.iterdir():
+            if cluster_dir.is_dir() and cluster_dir.name != "data.zarr":
+                try:
+                    if not any(cluster_dir.iterdir()):
+                        cluster_dir.rmdir()
+                except (OSError, StopIteration):
+                    pass
+        
+        logger.info(f"Removed: {len(orphan_list)}")
+        return len(orphan_list)
+    
+    def check_orphaned_downloads(self) -> Tuple[int, int]:
+        """Check for downloaded files not referenced in database."""
+        if not self.config.DOWNLOAD_DIR.exists():
+            return 0, 0
+        
+        db_files = self._get_database_filepaths()
+        orphan_list = self._find_orphaned_download_files(db_files)
+        
+        if orphan_list:
+            self._log_orphaned_downloads_report(orphan_list)
+            orphans_removed = self._remove_orphaned_downloads(orphan_list)
+        else:
+            orphans_removed = 0
+        
+        return len(orphan_list), orphans_removed
+    
+    def _get_database_filepaths(self) -> Set[Path]:
+        """Get all local_filepath values from database."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT local_filepath FROM tasks WHERE local_filepath IS NOT NULL")
+            return {Path(row['local_filepath']) for row in cursor.fetchall()}
+    
+    def _find_orphaned_download_files(self, db_files: Set[Path]) -> List[Path]:
+        """Find download files not in database."""
+        orphan_list = []
+        for file in self.config.DOWNLOAD_DIR.glob("*.tif"):
+            if file not in db_files:
+                orphan_list.append(file)
+        return orphan_list
+    
+    def _log_orphaned_downloads_report(self, orphan_list: List[Path]):
+        """Log orphaned download files report."""
+        logger.info(f"\n=== Orphaned Download Files ===")
+        logger.info(f"Found {len(orphan_list)} orphaned download files")
+        
+        for file in orphan_list:
+            logger.warning(f"  {file.name}")
+    
+    def _remove_orphaned_downloads(self, orphan_list: List[Path]) -> int:
+        """Remove orphaned download files if in clean mode."""
+        if not self.clean:
+            return 0
+        
+        for file in orphan_list:
+            file.unlink()
+        
+        logger.info(f"Removed: {len(orphan_list)}")
+        return len(orphan_list)
+    
+    # ==========================================================================
+    # Main Run Loop
+    # ==========================================================================
+    
+    def check_untracked_drive_files(self) -> Tuple[int, int]:
+        """Check for Drive files not referenced in database."""
+        drive_files = self._get_drive_files()
+        
+        # Get all task descriptions from database
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT gee_task_description FROM tasks WHERE gee_task_description IS NOT NULL")
+            db_task_descriptions = {row['gee_task_description'] for row in cursor.fetchall()}
+        
+        # Find Drive files not in database
+        untracked = drive_files - db_task_descriptions
+        
+        if untracked:
+            logger.info(f"\n=== Untracked Drive Files: {len(untracked)} files ===")
+            logger.warning(f"  These files are on Drive but have no database entry")
+            for desc in list(untracked)[:5]:
+                logger.warning(f"    {desc}")
+            if len(untracked) > 5:
+                logger.warning(f"    ... and {len(untracked) - 5} more")
+        
+        return len(untracked), 0
+    
+    def _get_database_stats(self) -> Dict[str, int]:
+        """Get count of tasks by status."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            if self.countries:
+                placeholders = ','.join('?' * len(self.countries))
+                cursor.execute(
+                    f"SELECT status, COUNT(*) as count FROM tasks WHERE country_code IN ({placeholders}) GROUP BY status",
+                    self.countries
+                )
+            else:
+                cursor.execute("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")
+            
+            return {row['status']: row['count'] for row in cursor.fetchall()}
+    
+    def run_checks(self) -> Dict[str, Tuple[int, int]]:
+        """Run all integrity checks.
+        
+        Returns:
+            Dict mapping check name to (issues_found, issues_fixed) tuple
+        """
+        results = {}
+        
+        # Collect filesystem state
+        drive_files = self._get_drive_files()
+        zarr_clusters = self._get_zarr_clusters()
+        
+        # Count database entries by status
+        db_stats = self._get_database_stats()
+        
+        # Log initial state
+        logger.info("=== Filesystem State ===")
+        if self.countries:
+            logger.info(f"  (Filtered to: {', '.join(self.countries)})")
+        for status, count in sorted(db_stats.items()):
+            logger.info(f"  {status}: {count}")
+        
+        if not self.check_zarr_index_integrity():
+            logger.warning("Zarr index arrays incomplete - using directory scanning")
+        
+        results['database'] = self.check_database_integrity()
+        results['reverse_integrity'] = self.check_reverse_integrity()
+        results['untracked_drive'] = self.check_untracked_drive_files()
+        results['zarr_orphans'] = self.check_orphaned_zarr()
+        results['download_orphans'] = self.check_orphaned_downloads()
+
+        return results
+    
+    def run(self, continuous: bool = True):
+        """Run the janitor worker.
+        
+        Args:
+            continuous: If True, run continuously; otherwise run once
+        """
+        logger.info(f"Starting {self.worker_name} worker")
+        
+        while True:
+            self.db.update_worker_heartbeat(self.worker_name, "running")
+            
+            try:
+                results = self.run_checks()
+                self._log_summary(results)
+                
+                total_issues = sum(found for found, _ in results.values())
+                if total_issues > 0:
+                    self.db.increment_worker_counter(self.worker_name, "tasks_processed")
+                
+            except Exception as e:
+                logger.error(f"Error during janitor checks: {e}", exc_info=True)
+                self.db.increment_worker_counter(self.worker_name, "errors")
+            
+            if not continuous:
+                break
+            
+            time.sleep(self.config.WORKER_SLEEP_INTERVAL * 10)
+        
+        self.db.update_worker_heartbeat(self.worker_name, "stopped")
+        logger.info(f"Stopped {self.worker_name} worker")
+    
+    def _log_summary(self, results: Dict[str, Tuple[int, int]]):
+        """Log summary of all checks."""
+        total_issues = sum(found for found, _ in results.values())
+        total_fixed = sum(fixed for _, fixed in results.values())
+        
+        logger.info(
+            f"\n=== Janitor Summary ===\n"
+            f"Total issues found: {total_issues}\n"
+            f"Total issues fixed: {total_fixed}\n"
+            f"  Database integrity: {results['database'][0]} found, {results['database'][1]} fixed\n"
+            f"  Reverse integrity: {results['reverse_integrity'][0]} found, {results['reverse_integrity'][1]} upgraded\n"
+            f"  Zarr orphans: {results['zarr_orphans'][0]} found, {results['zarr_orphans'][1]} removed\n"
+            f"  Download orphans: {results['download_orphans'][0]} found, {results['download_orphans'][1]} removed"
+        )

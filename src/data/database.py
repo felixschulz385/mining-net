@@ -1,337 +1,495 @@
-"""Database management for tracking download tasks and status."""
+"""Database management for tracking mining clusters and tiles using DuckDB."""
 
-import sqlite3
-import hashlib
+import duckdb
 import json
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 
 
+# Global lock for database access (shared across all instances)
+_db_locks = {}
+_db_locks_lock = threading.Lock()
+
+
 class DownloadDatabase:
-    """Manages SQLite database for tracking download tasks."""
+    """Manages DuckDB database for tracking mining clusters, tiles, and status."""
     
     def __init__(self, db_path: str = "mining_segmentation.db"):
         """Initialize database connection.
         
         Args:
-            db_path: Path to SQLite database file
+            db_path: Path to DuckDB database file
         """
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Get or create a lock for this specific database file
+        db_key = str(self.db_path.resolve())
+        with _db_locks_lock:
+            if db_key not in _db_locks:
+                _db_locks[db_key] = threading.RLock()
+            self._lock = _db_locks[db_key]
+        
+        self._ensure_spatial_extension()
         self._create_tables()
-        self._migrate_schema()
+    
+    def _ensure_spatial_extension(self):
+        """Install spatial extension once (persists across connections)."""
+        conn = duckdb.connect(str(self.db_path))
+        try:
+            conn.execute("INSTALL spatial;")
+            conn.execute("LOAD spatial;")
+        finally:
+            conn.close()
     
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        """Context manager for database connections with retry logic and locking."""
+        max_retries = 10
+        initial_delay = 0.1
+        max_delay = 5.0
+        backoff = 2.0
+        
+        delay = initial_delay
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                # Acquire lock before attempting connection
+                with self._lock:
+                    conn = duckdb.connect(str(self.db_path))
+                    try:
+                        # Load spatial extension (installed once during init)
+                        conn.execute("LOAD spatial;")
+                        yield conn
+                        conn.commit()
+                        return  # Success, exit
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except:
+                            pass  # DuckDB may not have active transaction
+                        raise
+                    finally:
+                        conn.close()
+            except (duckdb.IOException, OSError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    # Check if it's a file access error
+                    error_msg = str(e).lower()
+                    if "cannot open file" in error_msg or "verwendet wird" in error_msg or "being used" in error_msg:
+                        time.sleep(delay)
+                        delay = min(delay * backoff, max_delay)
+                        continue
+                raise
+        
+        # If we exhausted all retries, raise the last exception
+        if last_exception:
+            raise last_exception
     
     def _create_tables(self):
         """Create database tables if they don't exist."""
         with self.get_connection() as conn:
-            cursor = conn.cursor()
+            # Create sequence FIRST before referencing it in table
+            conn.execute("CREATE SEQUENCE IF NOT EXISTS seq_tasks START 1")
             
-            # Main tasks table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    geometry_hash TEXT NOT NULL UNIQUE,
-                    country_code TEXT NOT NULL,
-                    year INTEGER NOT NULL,
-                    cluster_id INTEGER,
-                    geometry_json TEXT NOT NULL,
-                    mining_footprint_json TEXT,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    gee_task_id TEXT,
-                    gee_task_description TEXT,
-                    drive_file_id TEXT,
-                    drive_filename TEXT,
-                    local_filepath TEXT,
-                    created_at TEXT NOT NULL,
-                    submitted_at TEXT,
-                    completed_at TEXT,
-                    downloaded_at TEXT,
-                    reprojected_at TEXT,
-                    error_message TEXT,
-                    UNIQUE(geometry_hash, year)
-                )
-            """)
-            
-            # Index for efficient queries
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_status 
-                ON tasks(status)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_country_year 
-                ON tasks(country_code, year)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_cluster 
-                ON tasks(cluster_id)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_geometry_hash 
-                ON tasks(geometry_hash)
-            """)
-            
-            # Tiles table - tracks 64x64 geobox tiles
-            cursor.execute("""
+            # Tiles table - indexed by cluster_id, tile_ix, tile_iy
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS tiles (
+                    cluster_id BIGINT NOT NULL,
                     tile_ix INTEGER NOT NULL,
                     tile_iy INTEGER NOT NULL,
-                    geometry_hash TEXT NOT NULL,
-                    year INTEGER NOT NULL,
-                    cluster_id INTEGER NOT NULL,
-                    mmap_written BOOLEAN DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    mmap_written_at TEXT,
-                    PRIMARY KEY (tile_ix, tile_iy, geometry_hash, year),
-                    FOREIGN KEY (geometry_hash, year) REFERENCES tasks(geometry_hash, year)
+                    PRIMARY KEY (cluster_id, tile_ix, tile_iy)
                 )
             """)
             
-            # Index for tile queries
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tiles_cluster 
-                ON tiles(cluster_id, year)
-            """)
-            cursor.execute("""
+            # Create indices for efficient tile queries
+            conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tiles_coords 
                 ON tiles(tile_ix, tile_iy)
             """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_tiles_mmap_written 
-                ON tiles(mmap_written)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tiles_cluster 
+                ON tiles(cluster_id)
+            """)
+            
+            # Cluster metadata table (includes footprint)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cluster (
+                    cluster_id BIGINT PRIMARY KEY,
+                    country_code VARCHAR NOT NULL,
+                    footprint GEOMETRY
+                )
+            """)
+            
+            # Tasks table - each task is a cluster/year realization
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id INTEGER PRIMARY KEY DEFAULT NEXTVAL('seq_tasks'),
+                    cluster_id BIGINT NOT NULL,
+                    year INTEGER NOT NULL,
+                    status VARCHAR NOT NULL DEFAULT 'pending',
+                    gee_task_id VARCHAR,
+                    UNIQUE (cluster_id, year)
+                )
+            """)
+            
+            # Create index for efficient task queries
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tasks_cluster_year
+                ON tasks(cluster_id, year)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_tasks_status
+                ON tasks(status)
             """)
             
             # Worker status table
-            cursor.execute("""
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS worker_status (
-                    worker_name TEXT PRIMARY KEY,
-                    last_heartbeat TEXT NOT NULL,
-                    status TEXT NOT NULL,
+                    worker_name VARCHAR PRIMARY KEY,
+                    last_heartbeat TIMESTAMP NOT NULL,
+                    status VARCHAR NOT NULL,
                     tasks_processed INTEGER DEFAULT 0,
                     errors INTEGER DEFAULT 0
                 )
             """)
     
-    def _migrate_schema(self):
-        """Migrate database schema for backward compatibility.
-        
-        Adds new columns to existing databases without breaking them.
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get current table info for tiles
-            cursor.execute("PRAGMA table_info(tiles)")
-            columns = {row[1] for row in cursor.fetchall()}
-            
-            # Add mmap columns if they don't exist (for migration from zarr-only schema)
-            if 'mmap_written' not in columns:
-                try:
-                    cursor.execute("ALTER TABLE tiles ADD COLUMN mmap_written BOOLEAN DEFAULT 0")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-            
-            if 'mmap_written_at' not in columns:
-                try:
-                    cursor.execute("ALTER TABLE tiles ADD COLUMN mmap_written_at TEXT")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-    
-    @staticmethod
-    def hash_geometry(geometry: Dict[str, Any]) -> str:
-        """Generate a unique hash for a geometry.
-        
-        Args:
-            geometry: GeoJSON geometry dict
-            
-        Returns:
-            SHA256 hash of the geometry
-        """
-        geom_str = json.dumps(geometry, sort_keys=True)
-        return hashlib.sha256(geom_str.encode()).hexdigest()
-    
-    def create_task(
-        self,
-        geometry: Dict[str, Any],
-        country_code: str,
-        year: int,
-        cluster_id: Optional[int] = None,
-        mining_footprint: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Create a new download task.
-        
-        Args:
-            geometry: GeoJSON geometry dict (used for hash and stored)
-            country_code: ISO3 country code
-            year: Year to download
-            cluster_id: Optional cluster ID for grouped mines
-            mining_footprint: Optional GeoJSON of combined mining polygons for cluster
-            
-        Returns:
-            Geometry hash (task ID)
-        """
-        geom_hash = self.hash_geometry(geometry)
-        geom_json = json.dumps(geometry)
-        mining_footprint_json = json.dumps(mining_footprint) if mining_footprint else None
-        
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("""
-                    INSERT INTO tasks (
-                        geometry_hash, country_code, year, 
-                        cluster_id, geometry_json, mining_footprint_json, status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-                """, (geom_hash, country_code, year, cluster_id, geom_json,
-                      mining_footprint_json, datetime.utcnow().isoformat()))
-            except sqlite3.IntegrityError:
-                # Task already exists
-                pass
-        
-        return geom_hash
-    
     def update_task_status(
         self,
-        geometry_hash: str,
+        cluster_id: int,
         year: int,
         status: str,
-        **kwargs
+        gee_task_id: Optional[str] = None
     ):
-        """Update task status and metadata.
+        """Update task status and optionally GEE task ID.
         
         Args:
-            geometry_hash: Task ID
+            cluster_id: Cluster ID
             year: Year
-            status: New status (pending, submitted, processing, completed, 
-                   downloaded, compressed, failed)
-            **kwargs: Additional fields to update
+            status: New status
+            gee_task_id: Optional GEE task ID to store
         """
-        fields = {"status": status}
-        fields.update(kwargs)
-        
-        # Add timestamp based on status
-        if status == "submitted" and "submitted_at" not in fields:
-            fields["submitted_at"] = datetime.utcnow().isoformat()
-        elif status == "completed" and "completed_at" not in fields:
-            fields["completed_at"] = datetime.utcnow().isoformat()
-        elif status == "downloaded" and "downloaded_at" not in fields:
-            fields["downloaded_at"] = datetime.utcnow().isoformat()
-        elif status in ("reprojected", "stored") and "reprojected_at" not in fields:
-            # Use reprojected_at for both (backward compatibility)
-            fields["reprojected_at"] = datetime.utcnow().isoformat()
-        
-        set_clause = ", ".join(f"{k} = ?" for k in fields.keys())
-        values = list(fields.values()) + [geometry_hash, year]
-        
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(f"""
-                UPDATE tasks 
-                SET {set_clause}
-                WHERE geometry_hash = ? AND year = ?
-            """, values)
+            if gee_task_id:
+                conn.execute("""
+                    UPDATE tasks
+                    SET status = ?, gee_task_id = ?
+                    WHERE cluster_id = ? AND year = ?
+                """, (status, gee_task_id, cluster_id, year))
+            else:
+                conn.execute("""
+                    UPDATE tasks
+                    SET status = ?
+                    WHERE cluster_id = ? AND year = ?
+                """, (status, cluster_id, year))
+
+    
+    def get_current_status(self, cluster_id: int, year: int) -> Optional[Dict[str, Any]]:
+        """Get the current status of a task.
+        
+        Args:
+            cluster_id: Cluster ID
+            year: Year
+            
+        Returns:
+            Dict with status information or None
+        """
+        with self.get_connection() as conn:
+            result = conn.execute("""
+                SELECT task_id, status FROM tasks
+                WHERE cluster_id = ? AND year = ?
+            """, (cluster_id, year)).fetchone()
+            
+            if result:
+                return {
+                    'task_id': result[0],
+                    'cluster_id': cluster_id,
+                    'year': year,
+                    'status': result[1]
+                }
+            return None
     
     def get_tasks_by_status(
         self,
         status: str,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        countries: Optional[List[str]] = None,
+        include_geometry: bool = False,
+        include_filenames: bool = False
     ) -> List[Dict[str, Any]]:
-        """Get tasks with a specific status.
+        """Get all tasks with a specific status.
         
         Args:
-            status: Task status to filter by
-            limit: Maximum number of tasks to return
+            status: Status to filter by
+            limit: Maximum number of results
+            countries: Optional list of ISO3 country codes to filter
+            include_geometry: Include footprint geometry in results
+            include_filenames: Include drive_filename and local_filepath in results
             
         Returns:
-            List of task dicts
+            List of dicts with task information
         """
-        query = "SELECT * FROM tasks WHERE status = ?"
-        params = [status]
+        from .config import Config
+        from pathlib import Path
         
-        if limit:
-            query += " LIMIT ?"
-            params.append(limit)
+        config = Config()
         
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+            # Build query based on what's needed
+            if include_geometry:
+                query = """
+                    SELECT
+                        t.task_id,
+                        t.cluster_id,
+                        t.year,
+                        t.status,
+                        c.country_code,
+                        ST_AsGeoJSON(c.footprint) as footprint_json,
+                        t.gee_task_id
+                    FROM tasks t
+                    LEFT JOIN cluster c ON t.cluster_id = c.cluster_id
+                    WHERE t.status = ?
+                """
+            else:
+                query = """
+                    SELECT
+                        t.task_id,
+                        t.cluster_id,
+                        t.year,
+                        t.status,
+                        c.country_code,
+                        t.gee_task_id
+                    FROM tasks t
+                    LEFT JOIN cluster c ON t.cluster_id = c.cluster_id
+                    WHERE t.status = ?
+                """
+            
+            # Add country filter if specified
+            if countries:
+                placeholders = ','.join(['?' for _ in countries])
+                query += f" AND c.country_code IN ({placeholders})"
+                params = [status] + countries
+            else:
+                params = [status]
+            
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            results = conn.execute(query, params).fetchall()
+            
+            tasks = []
+            for row in results:
+                task = {
+                    'task_id': row[0],
+                    'cluster_id': row[1],
+                    'year': row[2],
+                    'status': row[3],
+                    'country_code': row[4]
+                }
+                
+                # Add gee_task_id
+                if include_geometry:
+                    task['gee_task_id'] = row[6] if len(row) > 6 else None
+                    # Add geometry if requested
+                    footprint_geojson = json.loads(row[5]) if row[5] else None
+                    task['footprint'] = footprint_geojson
+                    task['geometry_json'] = json.dumps(footprint_geojson) if footprint_geojson else None
+                else:
+                    task['gee_task_id'] = row[5] if len(row) > 5 else None
+                
+                # Add filenames if requested
+                if include_filenames:
+                    cluster_id_hex = format(task['cluster_id'], 'x')[:8]
+                    drive_filename = f"LANDSAT_C02_T1_L2_{task['country_code']}_{cluster_id_hex}_{task['year']}"
+                    task['drive_filename'] = drive_filename
+                    task['local_filepath'] = str(config.DOWNLOAD_DIR / f"{drive_filename}.tif")
+                    # Add geometry_hash for backward compatibility
+                    task['geometry_hash'] = cluster_id_hex
+                
+                tasks.append(task)
+            
+            return tasks
     
-    def get_task(self, geometry_hash: str, year: int) -> Optional[Dict[str, Any]]:
-        """Get a specific task.
+    def get_tiles_for_cluster(
+        self,
+        cluster_id: int
+    ) -> List[Dict[str, Any]]:
+        """Get all tiles for a cluster.
         
         Args:
-            geometry_hash: Task ID
-            year: Year
+            cluster_id: Cluster ID
             
         Returns:
-            Task dict or None
+            List of tile dicts
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM tasks 
-                WHERE geometry_hash = ? AND year = ?
-            """, (geometry_hash, year))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+            results = conn.execute("""
+                SELECT cluster_id, tile_ix, tile_iy
+                FROM tiles
+                WHERE cluster_id = ?
+                ORDER BY tile_ix, tile_iy
+            """, (cluster_id,)).fetchall()
+            
+            return [
+                {
+                    'cluster_id': row[0],
+                    'tile_ix': row[1],
+                    'tile_iy': row[2]
+                }
+                for row in results
+            ]
     
-    def get_task_geometry(self, geometry_hash: str, year: int) -> Optional[Dict[str, Any]]:
-        """Get task geometry as GeoJSON.
+    def get_mining_footprint(
+        self,
+        cluster_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Get mining footprint for a cluster as GeoJSON.
         
         Args:
-            geometry_hash: Task ID
-            year: Year
+            cluster_id: Cluster ID
             
         Returns:
-            GeoJSON geometry dict or None
+            GeoJSON dict or None
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT geometry_json FROM tasks 
-                WHERE geometry_hash = ? AND year = ?
-            """, (geometry_hash, year))
-            row = cursor.fetchone()
-            if row and row['geometry_json']:
-                return json.loads(row['geometry_json'])
+            result = conn.execute("""
+                SELECT ST_AsGeoJSON(footprint) as geojson
+                FROM cluster
+                WHERE cluster_id = ?
+            """, (cluster_id,)).fetchone()
+            
+            if result and result[0]:
+                return json.loads(result[0])
             return None
     
-    def get_mining_footprint(self, geometry_hash: str, year: int) -> Optional[Dict[str, Any]]:
-        """Get mining footprint geometry for a task.
+    def get_cluster_info(self, cluster_id: int) -> Optional[Dict[str, Any]]:
+        """Get comprehensive cluster information.
         
         Args:
-            geometry_hash: Task ID
-            year: Year
+            cluster_id: Cluster ID
             
         Returns:
-            GeoJSON geometry dict or None
+            Dict with cluster metadata and tile inventory
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT mining_footprint_json FROM tasks 
-                WHERE geometry_hash = ? AND year = ?
-            """, (geometry_hash, year))
-            row = cursor.fetchone()
-            if row and row['mining_footprint_json']:
-                return json.loads(row['mining_footprint_json'])
-            return None
+            # Get cluster metadata
+            metadata = conn.execute("""
+                SELECT country_code
+                FROM cluster
+                WHERE cluster_id = ?
+            """, (cluster_id,)).fetchone()
+            
+            if not metadata:
+                return None
+            
+            # Get all years with stored status
+            stored_years = conn.execute("""
+                SELECT year
+                FROM tasks
+                WHERE cluster_id = ? AND status = 'stored'
+                ORDER BY year
+            """, (cluster_id,)).fetchall()
+            
+            years = [row[0] for row in stored_years]
+            
+            # Get tile count for this cluster
+            tile_count = conn.execute("""
+                SELECT COUNT(*)
+                FROM tiles
+                WHERE cluster_id = ?
+            """, (cluster_id,)).fetchone()[0]
+            
+            return {
+                'cluster_id': cluster_id,
+                'country_code': metadata[0],
+                'years': years,
+                'tile_count': tile_count,
+                'tiles': []  # No longer returning individual tiles
+            }
+    
+    def get_all_cluster_years(self) -> List[Dict[str, Any]]:
+        """Get all distinct cluster_id and year combinations.
+        
+        Returns:
+            List of dicts with cluster_id and year
+        """
+        with self.get_connection() as conn:
+            results = conn.execute("""
+                SELECT DISTINCT cluster_id, year
+                FROM tasks
+                ORDER BY cluster_id, year
+            """).fetchall()
+            
+            return [
+                {'cluster_id': row[0], 'year': row[1]}
+                for row in results
+            ]
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get database statistics.
+        
+        Returns:
+            Dict with statistics
+        """
+        with self.get_connection() as conn:
+            # Status counts from tasks
+            status_counts = conn.execute("""
+                SELECT status, COUNT(*) as count
+                FROM tasks
+                GROUP BY status
+            """).fetchall()
+            
+            # Country counts - distinct clusters per country
+            country_counts = conn.execute("""
+                SELECT country_code, COUNT(*) as count
+                FROM cluster
+                GROUP BY country_code
+            """).fetchall()
+            
+            # Year range
+            year_range = conn.execute("""
+                SELECT MIN(year) as min_year, MAX(year) as max_year
+                FROM tasks
+            """).fetchone()
+            
+            # Total clusters
+            total_clusters = conn.execute("""
+                SELECT COUNT(*) FROM cluster
+            """).fetchone()[0]
+            
+            # Total tasks
+            total_tasks = conn.execute("""
+                SELECT COUNT(*) FROM tasks
+            """).fetchone()[0]
+            
+            # Total tiles
+            total_tiles = conn.execute("""
+                SELECT COUNT(*) FROM tiles
+            """).fetchone()[0]
+            
+            # Stored tasks
+            stored_tasks = conn.execute("""
+                SELECT COUNT(*) FROM tasks WHERE status = 'stored'
+            """).fetchone()[0]
+            
+            return {
+                "status_counts": {row[0]: row[1] for row in status_counts},
+                "country_counts": {row[0]: row[1] for row in country_counts},
+                "year_range": {
+                    "min_year": year_range[0] if year_range else None,
+                    "max_year": year_range[1] if year_range else None
+                },
+                "total_clusters": total_clusters,
+                "total_tasks": total_tasks,
+                "total_tiles": total_tiles,
+                "stored_tasks": stored_tasks,
+                "storage_percentage": (stored_tasks / total_tasks * 100) if total_tasks > 0 else 0
+            }
     
     def update_worker_heartbeat(self, worker_name: str, status: str = "running"):
         """Update worker heartbeat.
@@ -341,14 +499,13 @@ class DownloadDatabase:
             status: Worker status
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
+            conn.execute("""
                 INSERT INTO worker_status (worker_name, last_heartbeat, status, tasks_processed, errors)
                 VALUES (?, ?, ?, 0, 0)
-                ON CONFLICT(worker_name) DO UPDATE SET
-                    last_heartbeat = excluded.last_heartbeat,
-                    status = excluded.status
-            """, (worker_name, datetime.utcnow().isoformat(), status))
+                ON CONFLICT (worker_name) DO UPDATE SET
+                    last_heartbeat = EXCLUDED.last_heartbeat,
+                    status = EXCLUDED.status
+            """, (worker_name, datetime.utcnow(), status))
     
     def increment_worker_counter(self, worker_name: str, counter: str = "tasks_processed"):
         """Increment worker counter.
@@ -358,221 +515,237 @@ class DownloadDatabase:
             counter: Counter to increment (tasks_processed or errors)
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(f"""
+            conn.execute(f"""
                 UPDATE worker_status 
                 SET {counter} = {counter} + 1
                 WHERE worker_name = ?
             """, (worker_name,))
     
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get download statistics.
+    def create_clusters_and_tiles(
+        self,
+        clusters_data: List[Dict[str, Any]],
+        tiles_data: List[tuple]
+    ) -> int:
+        """Batch insert clusters and tiles into the database.
+        
+        Args:
+            clusters_data: List of cluster dicts with cluster_id, country_code, mining_footprint_geojson
+            tiles_data: List of tuples (cluster_id, tile_ix, tile_iy)
         
         Returns:
-            Dict with statistics
+            Number of unique clusters inserted
         """
+        import pandas as pd
+        
         with self.get_connection() as conn:
-            cursor = conn.cursor()
+            # Deduplicate clusters by cluster_id
+            cluster_map = {}
+            for c in clusters_data:
+                cluster_id = c['cluster_id']
+                if cluster_id not in cluster_map:
+                    cluster_map[cluster_id] = c
             
-            # Status counts
-            cursor.execute("""
-                SELECT status, COUNT(*) as count
-                FROM tasks
-                GROUP BY status
+            unique_clusters = list(cluster_map.values())
+            
+            # Create DataFrame for cluster metadata with footprints
+            clusters_data = []
+            for c in unique_clusters:
+                footprint = c.get('mining_footprint_geojson')
+                clusters_data.append({
+                    'cluster_id': c['cluster_id'],
+                    'country_code': c['country_code'],
+                    'footprint_json': json.dumps(footprint) if footprint else None
+                })
+            
+            clusters_df = pd.DataFrame(clusters_data)
+            
+            # Insert clusters with footprints
+            conn.execute("""
+                INSERT INTO cluster (cluster_id, country_code, footprint)
+                SELECT cluster_id, country_code, ST_GeomFromGeoJSON(footprint_json) FROM clusters_df
+                ON CONFLICT (cluster_id) DO UPDATE SET
+                    country_code = EXCLUDED.country_code,
+                    footprint = EXCLUDED.footprint
             """)
-            status_counts = {row['status']: row['count'] for row in cursor.fetchall()}
             
-            # Country counts
-            cursor.execute("""
-                SELECT country_code, COUNT(DISTINCT geometry_hash) as count
-                FROM tasks
-                GROUP BY country_code
+            # Create DataFrame for tiles
+            tiles_df = pd.DataFrame(tiles_data, columns=['cluster_id', 'tile_ix', 'tile_iy'])
+            
+            # Insert tiles
+            conn.execute("""
+                INSERT INTO tiles (cluster_id, tile_ix, tile_iy)
+                SELECT cluster_id, tile_ix, tile_iy FROM tiles_df
+                ON CONFLICT DO NOTHING
             """)
-            country_counts = {row['country_code']: row['count'] for row in cursor.fetchall()}
-            
-            # Year range
-            cursor.execute("SELECT MIN(year) as min_year, MAX(year) as max_year FROM tasks")
-            year_range = dict(cursor.fetchone())
-            
-            return {
-                "status_counts": status_counts,
-                "country_counts": country_counts,
-                "year_range": year_range,
-                "total_tasks": sum(status_counts.values())
-            }
+        
+        return len(unique_clusters)
     
-    def create_tile(
-        self,
-        tile_ix: int,
-        tile_iy: int,
-        geometry_hash: str,
-        year: int,
-        cluster_id: int
-    ):
-        """Register a tile that will be written.
+    def get_all_cluster_ids(self, countries: Optional[List[str]] = None) -> List[int]:
+        """Get all cluster IDs, optionally filtered by country.
         
         Args:
-            tile_ix: Tile X index
-            tile_iy: Tile Y index  
-            geometry_hash: Geometry hash
-            year: Year
-            cluster_id: Cluster ID
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("""
-                    INSERT INTO tiles (
-                        tile_ix, tile_iy, geometry_hash, year,
-                        cluster_id, mmap_written, created_at
-                    ) VALUES (?, ?, ?, ?, ?, 0, ?)
-                """, (tile_ix, tile_iy, geometry_hash, year, 
-                      cluster_id, datetime.utcnow().isoformat()))
-            except sqlite3.IntegrityError:
-                # Tile already exists
-                pass
-    
-    def mark_tile_mmap_written(
-        self,
-        tile_ix: int,
-        tile_iy: int,
-        geometry_hash: str,
-        year: int,
-        cluster_id: int
-    ):
-        """Mark a tile as written to memory-mapped format (deprecated).
-        
-        Kept for backward compatibility. Use mark_tile_stored instead.
-        
-        Args:
-            tile_ix: Tile X index
-            tile_iy: Tile Y index
-            geometry_hash: Geometry hash
-            year: Year
-            cluster_id: Cluster ID for the tile
-        """
-        self.mark_tile_stored(tile_ix, tile_iy, geometry_hash, year, cluster_id)
-    
-    def mark_tile_stored(
-        self,
-        tile_ix: int,
-        tile_iy: int,
-        geometry_hash: str,
-        year: int,
-        cluster_id: int
-    ):
-        """Mark a tile as stored (in Zarr format).
-        
-        Args:
-            tile_ix: Tile X index
-            tile_iy: Tile Y index
-            geometry_hash: Geometry hash
-            year: Year
-            cluster_id: Cluster ID for the tile
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE tiles 
-                SET mmap_written = 1, cluster_id = ?, mmap_written_at = ?
-                WHERE tile_ix = ? AND tile_iy = ? 
-                  AND geometry_hash = ? AND year = ?
-            """, (cluster_id, datetime.utcnow().isoformat(),
-                  tile_ix, tile_iy, geometry_hash, year))
-    
-    def get_tiles_for_task(
-        self,
-        geometry_hash: str,
-        year: int
-    ) -> List[Dict[str, Any]]:
-        """Get all tiles for a task.
-        
-        Args:
-            geometry_hash: Geometry hash
-            year: Year
+            countries: Optional list of ISO3 country codes
             
         Returns:
-            List of tile dicts
+            List of cluster IDs
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM tiles 
-                WHERE geometry_hash = ? AND year = ?
-            """, (geometry_hash, year))
-            return [dict(row) for row in cursor.fetchall()]
+            if countries:
+                placeholders = ','.join(['?' for _ in countries])
+                query = f"""
+                    SELECT cluster_id FROM cluster
+                    WHERE country_code IN ({placeholders})
+                """
+                results = conn.execute(query, countries).fetchall()
+            else:
+                results = conn.execute("SELECT cluster_id FROM cluster").fetchall()
+            
+            return [row[0] for row in results]
     
-    def get_cluster_info(self, cluster_id: int) -> Optional[Dict[str, Any]]:
-        """Get comprehensive cluster information including all tiles and metadata.
+    def create_tasks(
+        self,
+        tasks_data: List[tuple]
+    ) -> int:
+        """Batch create tasks for cluster/year combinations.
+        
+        Args:
+            tasks_data: List of tuples (cluster_id, year, status) or (cluster_id, year)
+                        If status is omitted, defaults to 'pending'
+        
+        Returns:
+            Number of tasks actually created (not counting conflicts/duplicates)
+        """
+        import pandas as pd
+        
+        if not tasks_data:
+            return 0
+        
+        with self.get_connection() as conn:
+            # Convert tuples to DataFrame
+            # Handle both 2-tuple (cluster_id, year) and 3-tuple (cluster_id, year, status)
+            processed_tasks = []
+            for task in tasks_data:
+                if len(task) == 2:
+                    cluster_id, year = task
+                    status = 'pending'
+                else:
+                    cluster_id, year, status = task
+                processed_tasks.append({
+                    'cluster_id': cluster_id,
+                    'year': year,
+                    'status': status
+                })
+            
+            tasks_df = pd.DataFrame(processed_tasks)
+            
+            # Count existing tasks before insert to determine how many were actually added
+            # Build WHERE clause to check for existing cluster_id/year combinations
+            existing_count = conn.execute("""
+                SELECT COUNT(*)
+                FROM tasks t
+                WHERE EXISTS (
+                    SELECT 1 FROM tasks_df
+                    WHERE tasks_df.cluster_id = t.cluster_id
+                    AND tasks_df.year = t.year
+                )
+            """).fetchone()[0]
+            
+            # Insert tasks with explicit NEXTVAL for task_id, skipping conflicts
+            conn.execute("""
+                INSERT INTO tasks (task_id, cluster_id, year, status)
+                SELECT NEXTVAL('seq_tasks'), cluster_id, year, status FROM tasks_df
+                ON CONFLICT (cluster_id, year) DO NOTHING
+            """)
+            
+            # Return the number of new tasks created
+            return len(processed_tasks) - existing_count
+    
+    def get_task_count_for_cluster(self, cluster_id: int) -> int:
+        """Get number of tasks for a cluster.
         
         Args:
             cluster_id: Cluster ID
             
         Returns:
-            Dict with cluster metadata and tile inventory, or None if not found
+            Number of tasks
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
+            result = conn.execute("""
+                SELECT COUNT(*) FROM tasks WHERE cluster_id = ?
+            """, (cluster_id,)).fetchone()
             
-            # Get cluster metadata from tasks
-            cursor.execute("""
-                SELECT DISTINCT 
-                    cluster_id,
-                    country_code,
-                    MIN(created_at) as created_at,
-                    MAX(reprojected_at) as latest_reprojected_at
-                FROM tasks
-                WHERE cluster_id = ?
-                GROUP BY cluster_id, country_code
-            """, (cluster_id,))
+            return result[0] if result else 0
+    
+    def get_task_summary(self, countries: Optional[List[str]] = None) -> Dict[str, int]:
+        """Get count of tasks by status.
+        
+        Args:
+            countries: Optional list of ISO3 country codes to filter
             
-            metadata_row = cursor.fetchone()
-            if not metadata_row:
+        Returns:
+            Dict mapping status to count
+        """
+        with self.get_connection() as conn:
+            if countries:
+                placeholders = ','.join(['?' for _ in countries])
+                query = f"""
+                    SELECT t.status, COUNT(*) as count
+                    FROM tasks t
+                    JOIN cluster c ON t.cluster_id = c.cluster_id
+                    WHERE c.country_code IN ({placeholders})
+                    GROUP BY t.status
+                    ORDER BY t.status
+                """
+                results = conn.execute(query, countries).fetchall()
+            else:
+                results = conn.execute("""
+                    SELECT status, COUNT(*) as count
+                    FROM tasks
+                    GROUP BY status
+                    ORDER BY status
+                """).fetchall()
+            
+            return {row[0]: row[1] for row in results}
+    
+    def get_task_data(self, cluster_id: int, year: int) -> Optional[Dict[str, Any]]:
+        """Get complete task data for processing.
+        
+        This standardized method retrieves all information needed by workers
+        (gee_export, status_checker, download, store) to process a task.
+        
+        Args:
+            cluster_id: Cluster ID
+            year: Year
+            
+        Returns:
+            Dict with complete task information or None if not found
+        """
+        with self.get_connection() as conn:
+            result = conn.execute("""
+                SELECT
+                    t.task_id,
+                    t.cluster_id,
+                    t.year,
+                    t.status,
+                    c.country_code,
+                    ST_AsGeoJSON(c.footprint) as footprint_json
+                FROM tasks t
+                LEFT JOIN cluster c ON t.cluster_id = c.cluster_id
+                WHERE t.cluster_id = ? AND t.year = ?
+            """, (cluster_id, year)).fetchone()
+            
+            if not result:
                 return None
             
-            metadata = dict(metadata_row)
-            
-            # Get all tiles for this cluster with their years
-            cursor.execute("""
-                SELECT 
-                    tile_ix,
-                    tile_iy,
-                    year,
-                    geometry_hash,
-                    mmap_written,
-                    mmap_written_at
-                FROM tiles
-                WHERE cluster_id = ? AND mmap_written = 1
-                ORDER BY year, tile_ix, tile_iy
-            """, (cluster_id,))
-            
-            tiles = [dict(row) for row in cursor.fetchall()]
-            
-            # Get year range
-            years = sorted(set(t['year'] for t in tiles))
+            footprint_geojson = json.loads(result[5]) if result[5] else None
             
             return {
-                'cluster_id': metadata['cluster_id'],
-                'country_code': metadata['country_code'],
-                'created_at': metadata['created_at'],
-                'latest_reprojected_at': metadata['latest_reprojected_at'],
-                'years': years,
-                'tile_count': len(tiles),
-                'tiles': tiles
+                'task_id': result[0],
+                'cluster_id': result[1],
+                'year': result[2],
+                'status': result[3],
+                'country_code': result[4],
+                'footprint': footprint_geojson,
+                'geometry_json': json.dumps(footprint_geojson) if footprint_geojson else None
             }
-    
-    def get_all_cluster_years(self) -> List[Dict[str, Any]]:
-        """Get all distinct cluster_id and year combinations from database.
-        
-        Returns:
-            List of dicts with cluster_id and year
-        """
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT DISTINCT cluster_id, year 
-                FROM tasks 
-                WHERE cluster_id IS NOT NULL
-                ORDER BY cluster_id, year
-            """)
-            return [dict(row) for row in cursor.fetchall()]
+
