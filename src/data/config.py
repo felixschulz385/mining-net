@@ -58,7 +58,7 @@ class Config(BaseConfig):
     HPC_HOST = "transfer12.scicore.unibas.ch"
     HPC_USER = "schulz0022"
     HPC_BASE_PATH = "/scicore/home/meiera/schulz0022/projects/mining-net"
-    HPC_DATA_PATH = f"{HPC_BASE_PATH}/data"
+    HPC_DATA_PATH = f"{HPC_BASE_PATH}/data_nobackup"
     HPC_ZARR_PATH = f"{HPC_DATA_PATH}/landsat_mmap"
     HPC_BACKUP_PATH = f"{HPC_DATA_PATH}/backups"
     SSH_KEY = Path.home() / ".ssh" / "id_ed25519_scicore"
@@ -71,7 +71,7 @@ class Config(BaseConfig):
     MAX_SUBMITTED_TASKS = 10  # maximum number of tasks submitted to GEE
     
     # Geometry settings
-    BUFFER_SIZE = 0.05  # degrees
+    BUFFER_SIZE = 0.01  # degrees
     
     # Geobox settings (world grid aligned to 30m Landsat)
     WORLD_GEOBOX_RESOLUTION = 0.000269495  # ~30m at equator
@@ -85,10 +85,10 @@ class Config(BaseConfig):
     STATUS_SUBMITTED = "submitted"
     STATUS_COMPLETED = "completed"
     STATUS_DOWNLOADED = "downloaded"
-    STATUS_STORED = "stored"  # Stored in Zarr format
     STATUS_FAILED = "failed"
     
     # Legacy statuses (deprecated, kept for backward compatibility)
+    STATUS_STORED = "stored"  # Legacy: stored in Zarr format (deprecated)
     STATUS_REPROJECTED = "reprojected"  # Old MMAP format (deprecated)
     STATUS_COMPRESSED = "compressed"  # Deprecated
     STATUS_UPLOADED = "uploaded"  # Deprecated

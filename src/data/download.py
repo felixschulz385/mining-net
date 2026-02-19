@@ -5,6 +5,7 @@ import logging
 import os
 import pickle
 import io
+import json
 from typing import Optional, List
 from pathlib import Path
 
@@ -185,26 +186,48 @@ class DownloadWorker:
             
             fh.close()
             logger.info(f"✓ Downloaded: {filepath}")
-            
+
+            # Write metadata JSON alongside the downloaded TIFF
+            try:
+                tiles = self.db.get_tiles_for_cluster(cluster_id)
+                footprint = self.db.get_mining_footprint(cluster_id)
+
+                metadata = {
+                    "cluster_id": cluster_id,
+                    "country_code": country_code,
+                    "year": year,
+                    "tiles": [
+                        {"tile_ix": t["tile_ix"], "tile_iy": t["tile_iy"]} for t in tiles
+                    ],
+                    "footprint": footprint
+                }
+
+                metadata_path = filepath.with_suffix('.json')
+                with open(metadata_path, 'w', encoding='utf-8') as mf:
+                    json.dump(metadata, mf, indent=2)
+                logger.info(f"  Wrote metadata: {metadata_path}")
+            except Exception as e:
+                logger.warning(f"  Could not write metadata for {filepath}: {e}")
+
             # Delete from Drive
             try:
                 self.drive_service.files().delete(fileId=file_id).execute()
                 logger.info(f"  Deleted from Drive: {filename}")
             except Exception as e:
                 logger.warning(f"  Could not delete {filename}: {e}")
-            
+
             # Update database
             self.db.update_task_status(
                 task_data['cluster_id'],
                 task_data['year'],
                 self.config.STATUS_DOWNLOADED
             )
-            
+
             # Clear not-found counter on success
             task_key = (cluster_id, year)
             if task_key in self.file_not_found_count:
                 del self.file_not_found_count[task_key]
-            
+
             self.db.increment_worker_counter(self.worker_name, "tasks_processed")
             return True
             

@@ -1,7 +1,8 @@
-"""Janitor worker to verify Zarr index integrity.
+"""Janitor worker to verify Zarr index and downloaded-file integrity.
 
-The Janitor worker verifies that all tiles marked as STORED in the database
-are properly indexed in the Zarr store.
+The Janitor worker validates Zarr index entries and checks downloaded GeoTIFFs
+and their metadata. It can optionally repair metadata, demote tasks, or
+remove orphan files when run with `clean=True`.
 """
 
 import time
@@ -116,50 +117,108 @@ class JanitorWorker:
         
         logger.info(f"Checking {len(stored_tasks)} STORED tasks")
         
-        # Get Zarr index
-        zarr_tiles = self._get_zarr_tiles_from_index()
+
+    
+    def check_downloaded_tasks_integrity(self) -> Tuple[int, int]:
+        """Verify downloaded files exist, repair missing metadata, and optionally clean orphan files.
         
+        Returns:
+            Tuple of (issues_found, issues_fixed)
+        """
+        logger.info("Checking DOWNLOADED tasks and download-directory integrity...")
+
+        # Fetch downloaded tasks (optionally filtered by country)
+        if self.countries:
+            downloaded_tasks = []
+            for country in self.countries:
+                tasks = self.db.get_tasks_by_status(
+                    self.config.STATUS_DOWNLOADED,
+                    countries=[country],
+                    include_filenames=True
+                )
+                downloaded_tasks.extend(tasks)
+        else:
+            downloaded_tasks = self.db.get_tasks_by_status(
+                self.config.STATUS_DOWNLOADED, include_filenames=True
+            )
+
+        if not downloaded_tasks:
+            logger.info("No DOWNLOADED tasks found")
+            return 0, 0
+
         issues_found = 0
         issues_fixed = 0
-        
-        for task in stored_tasks:
+
+        expected_names = set()
+
+        for task in downloaded_tasks:
             cluster_id = task['cluster_id']
             year = task['year']
             country_code = task['country_code']
-            
-            # Get expected tiles from database
-            db_tiles = self.db.get_tiles_for_cluster(cluster_id)
-            expected_tiles = {(tile['tile_ix'], tile['tile_iy']) for tile in db_tiles}
-            
-            # Get actual tiles from Zarr
-            actual_tiles = zarr_tiles.get((cluster_id, year), set())
-            
-            # Check if all expected tiles are present
-            missing_tiles = expected_tiles - actual_tiles
-            
-            if missing_tiles:
+            local_fp = Path(task.get('local_filepath', ''))
+
+            if not local_fp:
+                logger.warning(f"Task missing local filepath metadata: {cluster_id}/{year}")
+                issues_found += 1
+                continue
+
+            expected_names.add(local_fp.name)
+
+            if not local_fp.exists():
                 issues_found += 1
                 logger.warning(
-                    f"Task {country_code} cluster={cluster_id} year={year}: "
-                    f"{len(missing_tiles)}/{len(expected_tiles)} tiles missing from Zarr index"
+                    f"Downloaded file missing for task {country_code} cluster={cluster_id} year={year}: {local_fp}"
                 )
-                
                 if self.clean:
-                    logger.info(f"  Demoting to DOWNLOADED to re-store")
-                    self.db.update_task_status(
-                        cluster_id,
-                        year,
-                        self.config.STATUS_DOWNLOADED
-                    )
+                    logger.info("  Demoting to COMPLETED to trigger re-download")
+                    self.db.update_task_status(cluster_id, year, self.config.STATUS_COMPLETED)
                     issues_fixed += 1
-        
-        if issues_found == 0:
-            logger.info("✓ All STORED tasks have complete tiles in Zarr index")
-        else:
-            logger.warning(f"Found {issues_found} tasks with missing tiles")
-            if self.clean:
-                logger.info(f"Fixed {issues_fixed} tasks by demoting to DOWNLOADED")
-        
+                continue
+
+            # Ensure metadata JSON exists alongside TIFF; recreate if missing
+            meta_path = local_fp.with_suffix('.json')
+            if not meta_path.exists():
+                issues_found += 1
+                logger.warning(f"Metadata JSON missing for {local_fp}")
+                if self.clean:
+                    try:
+                        tiles = self.db.get_tiles_for_cluster(cluster_id)
+                        footprint = self.db.get_mining_footprint(cluster_id)
+                        metadata = {
+                            "cluster_id": cluster_id,
+                            "country_code": country_code,
+                            "year": year,
+                            "tiles": [{"tile_ix": t["tile_ix"], "tile_iy": t["tile_iy"]} for t in tiles],
+                            "footprint": footprint
+                        }
+                        with open(meta_path, 'w', encoding='utf-8') as mf:
+                            import json
+                            json.dump(metadata, mf, indent=2)
+                        logger.info(f"  Recreated metadata: {meta_path}")
+                        issues_fixed += 1
+                    except Exception as e:
+                        logger.warning(f"  Could not recreate metadata for {local_fp}: {e}")
+
+        # Detect orphan TIFFs in the download directory (conservative: only files starting with 'LANDSAT_')
+        download_dir = Path(self.config.DOWNLOAD_DIR)
+        if download_dir.exists():
+            for p in download_dir.glob('LANDSAT_*'):
+                if p.suffix.lower() not in ('.tif', '.tiff'):
+                    continue
+                if p.name not in expected_names:
+                    issues_found += 1
+                    logger.warning(f"Orphan downloaded file: {p}")
+                    if self.clean:
+                        try:
+                            p.unlink()
+                            meta = p.with_suffix('.json')
+                            if meta.exists():
+                                meta.unlink()
+                            logger.info(f"  Removed orphan file: {p}")
+                            issues_fixed += 1
+                        except Exception as e:
+                            logger.warning(f"  Could not remove orphan file {p}: {e}")
+
         return issues_found, issues_fixed
     
     def run(self, continuous: bool = True):
@@ -174,12 +233,14 @@ class JanitorWorker:
             self.db.update_worker_heartbeat(self.worker_name, "running")
             
             try:
-                issues_found, issues_fixed = self.check_stored_tasks_integrity()
-                
+                d_found, d_fixed = self.check_downloaded_tasks_integrity()
+
+                issues_found = d_found
+                issues_fixed = d_fixed
+
                 if issues_found > 0:
                     logger.info(
-                        f"Integrity check complete: "
-                        f"{issues_found} issues found, {issues_fixed} fixed"
+                        f"Integrity check complete: {issues_found} issues found, {issues_fixed} fixed"
                     )
             except Exception as e:
                 logger.error(f"Error during integrity check: {e}", exc_info=True)

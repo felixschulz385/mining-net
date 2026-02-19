@@ -1,54 +1,76 @@
-"""Storage worker to convert downloaded GeoTIFFs to Zarr format.
+﻿"""Storage worker: converts downloaded GeoTIFFs into a Zarr dataset.
 
-This worker replaces the old reprojection worker. Instead of creating memory-mapped
-PyTorch files (.pt), it creates a single large Zarr group with all tiles.
+Architecture
+------------
+  ZarrStore       low-level Zarr I/O: create, resize, write, metadata bookkeeping
+  TileExtractor   pure computation: reproject + extract per-tile numpy arrays
+  StoreWorker     orchestration: validate  extract  write
 
-The worker:
-1. Loads downloaded GeoTIFF files
-2. Reprojects to the world geobox grid
-3. Appends tiles to global Zarr arrays (features, labels, indices)
-4. Maintains index arrays for cluster_id, tile_ix, tile_iy, year
-5. Uses chunking for efficient batch access
+Public API
+----------
+  store_task_to_zarr(task_data, config)        bool
+  process_downloaded_tasks(config, ...)        int
 """
 
-import time
-import logging
-from typing import Optional, List
-from pathlib import Path
-import warnings
-import json
+from __future__ import annotations
+
 import functools
 import gc
+import json
+import logging
+import time
+import warnings
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Generator, List, Optional, Sequence
 
 import numpy as np
+import dask.array as da
+import pandas as pd
 import zarr
 import xarray as xr
 import rioxarray as rxr
 from odc.geo.geobox import GeoBox, GeoboxTiles, geobox_union_conservative
 from odc.geo.geom import Geometry
-from odc.geo.xr import rasterize
+from odc.geo.xr import rasterize, ODCExtensionDa
 from shapely.geometry import shape
 
-from .database import DownloadDatabase
 from .config import Config
 
-# Silence GDAL warnings about unsupported warp options
-warnings.filterwarnings('ignore', message='.*CPLE_NotSupported.*warp options.*')
-
-# Suppress rasterio._env logger warnings about DTYPE
-logging.getLogger('rasterio._env').setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*CPLE_NotSupported.*warp options.*")
+logging.getLogger("rasterio._env").setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
 
-def retry_on_permission_error(max_retries=5, initial_delay=0.5, backoff=2.0):
-    """Decorator to retry operations on Windows permission errors.
-    
-    Args:
-        max_retries: Maximum number of retry attempts
-        initial_delay: Initial delay between retries in seconds
-        backoff: Multiplier for delay after each retry
-    """
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+BANDS: tuple[str, ...] = ("blue", "green", "red", "nir", "swir1", "swir2", "thermal")
+_BAND_INDEX: dict[int, str] = {i + 1: b for i, b in enumerate(BANDS)}
+_DEFAULT_CHUNK_SIZE: int = 64
+_FORMAT_VERSION: str = "2.0"
+
+
+def _blosc_codec() -> zarr.codecs.BloscCodec:
+    """Return a Blosc/zstd codec configured for fast I/O (clevel=0)."""
+    return zarr.codecs.BloscCodec(
+        cname="zstd", clevel=3, shuffle="bitshuffle", blocksize=0
+    )
+
+
+# ---------------------------------------------------------------------------
+# Retry decorator for Windows file-lock errors
+# ---------------------------------------------------------------------------
+
+def _retry_on_permission_error(
+    max_retries: int = 5,
+    initial_delay: float = 0.5,
+    backoff: float = 2.0,
+):
+    """Retry a function when a PermissionError is raised (Windows file-lock)."""
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -56,496 +78,806 @@ def retry_on_permission_error(max_retries=5, initial_delay=0.5, backoff=2.0):
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
-                except PermissionError as e:
+                except PermissionError as exc:
                     if attempt == max_retries - 1:
                         raise
                     logger.warning(
-                        f"PermissionError on attempt {attempt + 1}/{max_retries}: {e}. "
-                        f"Retrying in {delay:.2f}s..."
+                        "PermissionError (attempt %d/%d): %s  retrying in %.2fs",
+                        attempt + 1, max_retries, exc, delay,
                     )
                     time.sleep(delay)
                     delay *= backoff
-            return func(*args, **kwargs)
         return wrapper
     return decorator
 
 
-class StorageWorker:
-    """Worker to store downloaded files in Zarr format."""
-    
-    def __init__(self, db: DownloadDatabase, config: Optional[Config] = None, countries: Optional[List[str]] = None, mining_file: Optional[str] = None):
-        """Initialize storage worker.
-        
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TileSpec:
+    """Grid coordinates of a single world-geobox tile."""
+    tile_ix: int
+    tile_iy: int
+
+
+@dataclass
+class TileBatch:
+    """In-memory tile data ready for a single Zarr slice-write."""
+    features: list[np.ndarray]    # each (C, H, W) float32
+    labels: list[np.ndarray]      # each (1, H, W) float32
+    cluster_ids: list[int]
+    tile_ixs: list[int]
+    tile_iys: list[int]
+    years: list[int]
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+    @classmethod
+    def concat(cls, a: "TileBatch", b: "TileBatch") -> "TileBatch":
+        """Return a new TileBatch that is `a` followed by `b`. Does not
+        mutate the inputs.
+        """
+        return TileBatch(
+            features=list(a.features) + list(b.features),
+            labels=list(a.labels) + list(b.labels),
+            cluster_ids=list(a.cluster_ids) + list(b.cluster_ids),
+            tile_ixs=list(a.tile_ixs) + list(b.tile_ixs),
+            tile_iys=list(a.tile_iys) + list(b.tile_iys),
+            years=list(a.years) + list(b.years),
+        )
+
+    @classmethod
+    def split(cls, batch: "TileBatch", n: int) -> tuple["TileBatch", "TileBatch"]:
+        """Return (batch[:n], batch[n:]).  Either half may be empty.
+        Does not mutate the input.
+        """
+        left = TileBatch(
+            features=list(batch.features[:n]),
+            labels=list(batch.labels[:n]),
+            cluster_ids=list(batch.cluster_ids[:n]),
+            tile_ixs=list(batch.tile_ixs[:n]),
+            tile_iys=list(batch.tile_iys[:n]),
+            years=list(batch.years[:n]),
+        )
+        right = TileBatch(
+            features=list(batch.features[n:]),
+            labels=list(batch.labels[n:]),
+            cluster_ids=list(batch.cluster_ids[n:]),
+            tile_ixs=list(batch.tile_ixs[n:]),
+            tile_iys=list(batch.tile_iys[n:]),
+            years=list(batch.years[n:]),
+        )
+        return left, right
+
+
+@dataclass
+class TaskData:
+    """Validated, typed representation of a single store task."""
+    local_filepath: Path
+    cluster_id: int
+    country_code: str
+    year: int
+    tiles: list[dict]
+    geometry_hash: str = ""
+    footprint: Optional[dict] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> TaskData:
+        """Parse and validate a raw task dict.
+
+        Raises:
+            KeyError: If required fields are missing.
+            ValueError: If year or cluster_id cannot be coerced.
+        """
+        return cls(
+            local_filepath=Path(d["local_filepath"]),
+            cluster_id=int(d.get("cluster_id") or 0),
+            country_code=d["country_code"],
+            year=int(d["year"]),
+            tiles=list(d["tiles"]),
+            geometry_hash=str(d.get("geometry_hash") or ""),
+            footprint=d.get("footprint"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# ZarrStore: pure I/O layer
+# ---------------------------------------------------------------------------
+
+class ZarrStore:
+    """Zarr array I/O: create, resize, write, and metadata bookkeeping.
+
+    Separates all disk interactions from processing logic.  The underlying
+    group is opened fresh per operation to avoid Windows file-lock buildup.
+
+    Lifecycle::
+
+        store = ZarrStore(zarr_dir, tile_shape)
+        store.create(capacity)          # once: writes empty Zarr structure and allocates capacity
+        store.write_batch(0, batch)
+        store.advance_index(len(batch))
+
+    To resume writing to an existing store, simply omit ``create``; the
+    metadata JSON restores the write position.
+    """
+
+    _METADATA_FILENAME = "store_metadata.json"
+    _STORE_DIRNAME = "data.zarr"
+
+    def __init__(
+        self,
+        zarr_dir: Path,
+        tile_shape: tuple[int, int],
+        chunk_size: int = _DEFAULT_CHUNK_SIZE,
+    ) -> None:
+        self._zarr_dir = zarr_dir
+        self._tile_shape = tile_shape
+        self._chunk_size = chunk_size
+        self._store_path = zarr_dir / self._STORE_DIRNAME
+        self._metadata_path = zarr_dir / self._METADATA_FILENAME
+
+        self._zarr_dir.mkdir(parents=True, exist_ok=True)
+        self._metadata = self._load_or_create_metadata()
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def store_path(self) -> Path:
+        return self._store_path
+
+    @property
+    def next_index(self) -> int:
+        return self._metadata["next_index"]
+
+    @property
+    def capacity(self) -> int:
+        return self._metadata.get("capacity", 0)
+
+    @property
+    def exists(self) -> bool:
+        return self._store_path.exists()
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def create(self, capacity: int) -> None:
+        """Create a new Zarr store and allocate `capacity` tiles.
+
+        Writes dask-backed empty arrays sized to `capacity` so the store is
+        immediately ready for writes.
+
         Args:
-            db: Database instance
-            config: Configuration instance
-            countries: Optional list of ISO3 country codes to filter tasks
-            mining_file: Unused (kept for backward compatibility)
+            capacity: number of tiles to allocate (must be > 0)
+
+        Raises:
+            FileExistsError: If a store already exists at this path.
+            ValueError: If capacity <= 0.
         """
-        self.db = db
-        self.config = config or Config()
-        self.countries = countries
-        self.worker_name = "storage"
-        
-        # Setup world geobox
-        self.world_geobox = GeoBox.from_bbox(
-            [-180, -90, 180, 90],
-            resolution=self.config.WORLD_GEOBOX_RESOLUTION,
-            crs=4326
-        )
-        self.world_geobox_tiles = GeoboxTiles(
-            self.world_geobox, 
-            self.config.WORLD_GEOBOX_TILE_SIZE
-        )
-        
-        # Setup Zarr output directory
-        self.zarr_path = self.config.DATA_DIR / "landsat_zarr"
-        self.zarr_path.mkdir(exist_ok=True, parents=True)
-        
-        # Bands to process
-        self.bands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'thermal']
-        
-        # Initialize store structure (but don't keep group open)
-        self._init_zarr_store()
-        self.store_path = self.zarr_path / "data.zarr"
-        
-        logger.info(f"Initialized storage worker with Zarr output: {self.zarr_path}")
-    
-    def _init_zarr_store(self):
-        """Initialize or open the global Zarr store with resizable arrays.
-        
-        Uses xarray to create the initial structure, then opens with plain zarr for writing.
+        if capacity <= 0:
+            raise ValueError(f"Capacity must be > 0, got {capacity}.")
+        if self._store_path.exists():
+            raise FileExistsError(
+                f"Zarr store already exists at {self._store_path}. "
+                "Delete the directory to start fresh."
+            )
+        # create arrays sized to `capacity` and write skeleton metadata to disk
+        self._write_empty_store(capacity)
+        self._metadata["capacity"] = capacity
+        self._metadata["next_index"] = 0
+        self._save_metadata()
+        logger.info("Created Zarr store at %s (capacity=%d)", self._store_path, capacity)
+
+    # initialize_capacity removed — capacity is now allocated at create(capacity).
+
+    def check_capacity(self, n_new_tiles: int) -> bool:
+        """Return True when the store can accept n_new_tiles additional tiles."""
+        required = self.next_index + n_new_tiles
+        if required > self.capacity:
+            logger.error(
+                "Zarr capacity exceeded: capacity=%d, required=%d. "
+                "Recreate the store with larger capacity.",
+                self.capacity, required,
+            )
+            return False
+        return True
+
+    @_retry_on_permission_error(max_retries=5, initial_delay=1.0)
+    def write_batch(self, start_idx: int, batch: TileBatch) -> None:
+        """Write a TileBatch to Zarr starting at start_idx.
+
+        Opens, writes, and closes the Zarr group in a single cycle to avoid
+        file-lock buildup on Windows.
         """
-        store_path = self.zarr_path / "data.zarr"
-        metadata_path = self.zarr_path / "store_metadata.json"
-        
-        # Load or create metadata tracking current position
-        if metadata_path.exists():
-            with open(metadata_path, 'r') as f:
-                self.store_metadata = json.load(f)
-        else:
-            self.store_metadata = {
-                "next_index": 0,
-                "tile_size": self.config.WORLD_GEOBOX_TILE_SIZE,
-                "n_bands": len(self.bands),
-                "chunk_size": 8,
-                "format_version": "1.0"
-            }
-            with open(metadata_path, 'w') as f:
-                json.dump(self.store_metadata, f, indent=2)
-        
-        self.metadata_path = metadata_path
-        tile_h, tile_w = self.config.WORLD_GEOBOX_TILE_SIZE
-        n_bands = len(self.bands)
-        chunk_size = self.store_metadata["chunk_size"]
-        
-        # Open or create Zarr group
-        if store_path.exists():
-            # Open existing store with plain zarr
-            self.zarr_group = zarr.open_group(store=str(store_path), mode='r+', zarr_format=3)
-            logger.info(f"Opened existing Zarr store at {store_path}")
-        else:
-            # Create new store using xarray with empty arrays, then open with zarr
-            logger.info(f"Creating new Zarr store at {store_path}")
-            
-            # Create xarray Dataset with proper structure using 0-length arrays
-            ds = xr.Dataset(
+        end_idx = start_idx + len(batch)
+        features_arr = np.stack(batch.features, axis=0)          # (N, C, H, W)
+        labels_arr = np.stack(batch.labels, axis=0)              # (N, 1, H, W)
+        cluster_ids_arr = np.array(batch.cluster_ids, dtype=np.int64)
+        tile_ixs_arr = np.array(batch.tile_ixs, dtype=np.int32)
+        tile_iys_arr = np.array(batch.tile_iys, dtype=np.int32)
+        years_arr = np.array(batch.years, dtype=np.int32)
+
+        # Build the batch Dataset with the same dims/coords as the empty
+        # store so `to_zarr(region='auto')` can align variables correctly.
+        tile_h, tile_w = self._tile_shape
+        n_bands = len(BANDS)
+
+        ds_batch = (
+            xr.Dataset(
                 data_vars={
-                    'features': (
-                        ['tile', 'channel', 'y', 'x'],
-                        np.zeros((0, n_bands, tile_h, tile_w), dtype=np.float32),
-                        {'long_name': 'Landsat features', 'units': 'reflectance'}
+                    "features": (["tile", "channel", "y", "x"], features_arr),
+                    "labels": (["tile", "label_channel", "y", "x"], labels_arr),
+                },
+                coords={
+                    "tile": pd.RangeIndex(start_idx, end_idx),
+                    "channel": np.arange(n_bands),
+                    "y": np.arange(tile_h),
+                    "x": np.arange(tile_w),
+                    "label_channel": [0],
+                },
+            )
+            .assign_coords(
+                cluster_id=("tile", cluster_ids_arr),
+                tile_ix=("tile", tile_ixs_arr),
+                tile_iy=("tile", tile_iys_arr),
+                year=("tile", years_arr),
+            )
+        )
+
+        # write into existing store (mode='r+'), let xarray handle the region write
+        ds_batch.to_zarr(str(self._store_path), mode="r+", consolidated=False, region="auto", compute=True)
+
+        logger.debug("Wrote %d tiles to Zarr [%d:%d] via xarray.to_zarr", len(batch), start_idx, end_idx)
+
+    def advance_index(self, n: int) -> int:
+        """Advance the write pointer by n tiles, persist, and return the new index."""
+        self._metadata["next_index"] += n
+        self._save_metadata()
+        return self._metadata["next_index"]
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _open(self) -> Generator[zarr.Group, None, None]:
+        """Open and cleanly close the Zarr group as a context manager."""
+        group = zarr.open_group(
+            store=str(self._store_path), mode="r+", zarr_format=3
+        )
+        try:
+            yield group
+        finally:
+            _close_zarr_group(group)
+
+    def _write_empty_store(self, capacity: int) -> None:
+        tile_h, tile_w = self._tile_shape
+        n_bands = len(BANDS)
+        chunk = self._chunk_size
+        codec = _blosc_codec()
+
+        # create dask-backed empty arrays (not computed) sized to `capacity`
+        features = da.zeros(
+            (capacity, n_bands, tile_h, tile_w), dtype=np.float32,
+            chunks=(chunk, n_bands, tile_h, tile_w),
+        )
+        labels = da.zeros(
+            (capacity, 1, tile_h, tile_w), dtype=np.float32,
+            chunks=(chunk, 1, tile_h, tile_w),
+        )
+
+        ds = (
+            xr.Dataset(
+                data_vars={
+                    "features": (
+                        ["tile", "channel", "y", "x"],
+                        features,
+                        {"long_name": "Landsat features", "units": "reflectance"},
                     ),
-                    'labels': (
-                        ['tile', 'label_channel', 'y', 'x'],
-                        np.zeros((0, 1, tile_h, tile_w), dtype=np.float32),
-                        {'long_name': 'Mining labels', 'units': 'binary'}
+                    "labels": (
+                        ["tile", "label_channel", "y", "x"],
+                        labels,
+                        {"long_name": "Mining labels", "units": "binary"},
                     ),
                 },
                 coords={
-                    'tile': np.array([], dtype=np.int64),
-                    'channel': np.arange(n_bands),
-                    'y': np.arange(tile_h),
-                    'x': np.arange(tile_w),
-                    'label_channel': [0],
-                }
-            )
-            
-            # Add non-dimension coordinates
-            ds = ds.assign_coords(
-                cluster_id=('tile', np.array([], dtype=np.int64)),
-                tile_ix=('tile', np.array([], dtype=np.int32)),
-                tile_iy=('tile', np.array([], dtype=np.int32)),
-                year=('tile', np.array([], dtype=np.int32)),
-            )
-            
-            # Add metadata
-            ds.attrs['description'] = 'Mining segmentation dataset from Landsat imagery'
-            ds.attrs['tile_shape'] = f"{tile_h}x{tile_w}"
-            ds.attrs['n_channels'] = n_bands
-            
-            # Write to zarr with xarray (structure only, no computation)
-            ds.to_zarr(
-                str(store_path),
-                mode='w',
-                encoding={
-                    'features': {
-                        'chunks': (chunk_size, n_bands, tile_h, tile_w),
-                        'compressor': zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
-                    },
-                    'labels': {
-                        'chunks': (chunk_size, 1, tile_h, tile_w),
-                        'compressor': zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
-                    },
-                    'cluster_id': {
-                        'chunks': (chunk_size,),
-                        'compressor': zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
-                    },
-                    'tile_ix': {
-                        'chunks': (chunk_size,),
-                        'compressor': zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
-                    },
-                    'tile_iy': {
-                        'chunks': (chunk_size,),
-                        'compressor': zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
-                    },
-                    'year': {
-                        'chunks': (chunk_size,),
-                        'compressor': zarr.codecs.BloscCodec(cname='zstd', clevel=0, shuffle="shuffle", blocksize=0),
-                    },
+                    # use a pandas RangeIndex for the tile coordinate (fast indexing/serialization)
+                    "tile": pd.RangeIndex(0, capacity),
+                    "channel": np.arange(n_bands),
+                    "y": np.arange(tile_h),
+                    "x": np.arange(tile_w),
+                    "label_channel": [0],
                 },
-                consolidated=False,
-                zarr_format=3,
-                compute=False
             )
-            
-            logger.info(f"Created Zarr structure with xarray")
-            # Don't keep group open - we'll open it per operation to avoid async issues
-    
-    def _open_zarr_group(self):
-        """Open zarr group for operations. Opens fresh each time to avoid async shutdown issues."""
-        return zarr.open_group(store=str(self.store_path), mode='r+', zarr_format=3)
-    
-    def _close_zarr_group(self, zarr_group):
-        """Properly close a zarr group with synchronization and cleanup.
-        
-        Args:
-            zarr_group: The zarr group to close
-        """
-        try:
-            # Ensure all pending writes complete
-            if hasattr(zarr_group.store, 'sync'):
-                zarr_group.store.sync()
-            
-            # Close the store if it has a close method
-            if hasattr(zarr_group.store, 'close'):
-                zarr_group.store.close()
-        except Exception as e:
-            logger.warning(f"Error during zarr group cleanup: {e}")
-        finally:
-            # Delete reference to allow garbage collection
-            del zarr_group
-            # Force garbage collection to release handles
-            gc.collect()
-            # Give Windows time to release file locks (longer for async operations)
-            time.sleep(0.5)
-    
-    @retry_on_permission_error(max_retries=5, initial_delay=1.0)
-    def _ensure_capacity(self, n_new_tiles: int):
-        """Ensure Zarr arrays have enough capacity for new tiles.
-        
-        Note: Resizing is done using plain zarr after xarray creates the initial structure.
-        """
-        next_idx = self.store_metadata["next_index"]
-        
-        # Open zarr group fresh for this operation
-        zarr_group = self._open_zarr_group()
-        
-        try:
-            current_size = zarr_group['features'].shape[0]
-            required_size = next_idx + n_new_tiles
-            
-            if required_size > current_size:
-                # Resize to accommodate new tiles with some buffer
-                new_size = max(required_size, int(current_size * 1.5))
-                logger.info(f"Resizing Zarr arrays from {current_size} to {new_size}")
-                
-                # Resize data arrays and coordinate arrays using plain zarr
-                for array_name in ['features', 'labels', 'cluster_id', 'tile_ix', 'tile_iy', 'year', 'tile']:
-                    array = zarr_group[array_name]
-                    new_shape = list(array.shape)
-                    new_shape[0] = new_size
-                    array.resize(tuple(new_shape))
-                
-                # Update tile coordinate with new indices
-                zarr_group['tile'][current_size:new_size] = np.arange(current_size, new_size)
-        finally:
-            # Properly close the zarr group
-            self._close_zarr_group(zarr_group)
-    
-    def _save_metadata(self):
-        """Save metadata to disk."""
-        with open(self.metadata_path, 'w') as f:
-            json.dump(self.store_metadata, f, indent=2)
-    
-    @retry_on_permission_error(max_retries=5, initial_delay=1.0)
-    def _write_tiles(self, start_idx, features_list, labels_list, cluster_ids, tile_ixs, tile_iys, years):
-        """Write all tiles to zarr arrays at once.
-        
-        Args:
-            start_idx: Starting index in zarr arrays
-            features_list: List of feature arrays
-            labels_list: List of label arrays
-            cluster_ids: List of cluster IDs
-            tile_ixs: List of tile x indices
-            tile_iys: List of tile y indices
-            years: List of years
-        """
-        zarr_group = self._open_zarr_group()
-        
-        try:
-            # Stack all tiles into single arrays for batch writing
-            n_tiles = len(features_list)
-            end_idx = start_idx + n_tiles
-            
-            # Stack features: (n_tiles, C, H, W)
-            features_batch = np.stack(features_list, axis=0)
-            
-            # Stack labels: (n_tiles, 1, H, W) 
-            labels_batch = np.stack(labels_list, axis=0)
-            
-            # Convert metadata to arrays
-            cluster_ids_batch = np.array(cluster_ids, dtype=np.int64)
-            tile_ixs_batch = np.array(tile_ixs, dtype=np.int32)
-            tile_iys_batch = np.array(tile_iys, dtype=np.int32)
-            years_batch = np.array(years, dtype=np.int32)
-            
-            # Write all tiles at once to slices
-            zarr_group['features'][start_idx:end_idx] = features_batch
-            zarr_group['labels'][start_idx:end_idx] = labels_batch
-            zarr_group['cluster_id'][start_idx:end_idx] = cluster_ids_batch
-            zarr_group['tile_ix'][start_idx:end_idx] = tile_ixs_batch
-            zarr_group['tile_iy'][start_idx:end_idx] = tile_iys_batch
-            zarr_group['year'][start_idx:end_idx] = years_batch
-            
-            # Sync to ensure all writes complete
-            if hasattr(zarr_group.store, 'sync'):
-                zarr_group.store.sync()
-            # Wait for async operations to finish
-            time.sleep(0.5)
-        finally:
-            # Properly close the zarr group with synchronization
-            self._close_zarr_group(zarr_group)
-    
-    def store_to_zarr(self, task_data: dict) -> bool:
-        """Store downloaded file to grid and save as Zarr arrays.
-        
-        Reprojects entire cluster once, then extracts and stores individual tiles to global Zarr.
-        
-        Args:
-            task_data: Task data from database
-            
+            .assign_coords(
+                cluster_id=("tile", da.full((capacity,), -1, dtype=np.int64, chunks=(chunk,))),
+                tile_ix=("tile", da.full((capacity,), -1, dtype=np.int32, chunks=(chunk,))),
+                tile_iy=("tile", da.full((capacity,), -1, dtype=np.int32, chunks=(chunk,))),
+                year=("tile", da.full((capacity,), -1, dtype=np.int32, chunks=(chunk,))),
+            )
+        )
+        ds.attrs.update(
+            description="Mining segmentation dataset from Landsat imagery",
+            tile_shape=f"{tile_h}x{tile_w}",
+            n_channels=n_bands,
+        )
+        ds.to_zarr(
+            str(self._store_path),
+            mode="w",
+            encoding={
+                "features":   {"chunks": (chunk, n_bands, tile_h, tile_w), "compressors": codec, "fill_value": 0.0},
+                "labels":     {"chunks": (chunk, 1, tile_h, tile_w),       "compressors": codec, "fill_value": 0.0},
+                "cluster_id": {"chunks": (chunk,),                         "compressors": codec, "fill_value": -1},
+                "tile_ix":    {"chunks": (chunk,),                         "compressors": codec, "fill_value": -1},
+                "tile_iy":    {"chunks": (chunk,),                         "compressors": codec, "fill_value": -1},
+                "year":       {"chunks": (chunk,),                         "compressors": codec, "fill_value": -1},
+            },
+            consolidated=False,
+            zarr_format=3,
+            compute=False,
+            write_empty_chunks=False,
+        )
+
+    def _load_or_create_metadata(self) -> dict:
+        if self._metadata_path.exists():
+            with open(self._metadata_path, encoding="utf-8") as f:
+                return json.load(f)
+        metadata: dict = {
+            "next_index": 0,
+            "capacity": 0,
+            "tile_size": list(self._tile_shape),
+            "n_bands": len(BANDS),
+            "chunk_size": self._chunk_size,
+            "format_version": _FORMAT_VERSION,
+        }
+        self._save_metadata(metadata)
+        return metadata
+
+    def _save_metadata(self, data: Optional[dict] = None) -> None:
+        payload = data if data is not None else self._metadata
+        with open(self._metadata_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
+def _close_zarr_group(group: zarr.Group) -> None:
+    """Sync and close a Zarr group, suppressing cleanup errors."""
+    try:
+        if hasattr(group.store, "sync"):
+            group.store.sync()
+        if hasattr(group.store, "close"):
+            group.store.close()
+    except Exception as exc:
+        logger.warning("Error closing Zarr group: %s", exc)
+    finally:
+        gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# TileExtractor: pure computation layer
+# ---------------------------------------------------------------------------
+
+class TileExtractor:
+    """Reprojects a GeoTIFF onto the world grid and extracts per-tile arrays.
+
+    Entirely stateless with respect to disk; operates only on in-memory
+    xarray/numpy objects.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._world_geobox = GeoBox.from_bbox(
+            [-180, -90, 180, 90],
+            resolution=config.WORLD_GEOBOX_RESOLUTION,
+            crs=4326,
+        )
+        self._world_tiles = GeoboxTiles(
+            self._world_geobox, config.WORLD_GEOBOX_TILE_SIZE
+        )
+
+    def extract(self, task: TaskData) -> TileBatch:
+        """Reproject task.local_filepath and extract all tiles.
+
         Returns:
-            True if successful, False otherwise
+            TileBatch ready for writing to the Zarr store.
+
+        Raises:
+            FileNotFoundError: If the TIFF does not exist on disk.
+            ValueError: If the tile list is empty.
+        """
+        if not task.local_filepath.exists():
+            raise FileNotFoundError(f"TIFF not found: {task.local_filepath}")
+        if not task.tiles:
+            raise ValueError(
+                f"No tiles specified for task {task.geometry_hash!r} year={task.year}"
+            )
+
+        tile_specs = [TileSpec(t["tile_ix"], t["tile_iy"]) for t in task.tiles]
+        union_geobox = geobox_union_conservative(
+            [self._world_tiles[s.tile_ix, s.tile_iy] for s in tile_specs]
+        )
+        logger.info(
+            "Reprojecting %s -> %s (%d tiles)",
+            task.local_filepath.name, union_geobox.shape, len(tile_specs),
+        )
+
+        image = rxr.open_rasterio(task.local_filepath)
+        try:
+            reprojected = self._reproject(image, union_geobox)
+        finally:
+            image.close()
+
+        mining_mask = self._rasterize_footprint(task, union_geobox)
+        return self._build_batch(task, tile_specs, reprojected, mining_mask)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reproject(image: xr.DataArray, geobox: GeoBox) -> xr.Dataset:
+        reprojected = image.odc.reproject(geobox)
+        reprojected.coords["latitude"] = (
+            reprojected.coords["latitude"].values.round(5)
+        )
+        reprojected.coords["longitude"] = (
+            reprojected.coords["longitude"].values.round(5)
+        )
+        return reprojected.to_dataset(dim="band").rename(_BAND_INDEX)
+
+    def _rasterize_footprint(
+        self, task: TaskData, geobox: GeoBox
+    ) -> Optional[xr.DataArray]:
+        if task.year != self._config.GROUND_TRUTH_YEAR or task.footprint is None:
+            return None
+        geom = Geometry(shape(task.footprint), crs=4326)
+        mask = rasterize(geom, geobox)
+        logger.info("Rasterized footprint for ground-truth year %d", task.year)
+        return mask
+
+    def _build_batch(
+        self,
+        task: TaskData,
+        tile_specs: list[TileSpec],
+        reprojected: xr.Dataset,
+        mining_mask: Optional[xr.DataArray],
+    ) -> TileBatch:
+        batch = TileBatch(
+            features=[], labels=[],
+            cluster_ids=[], tile_ixs=[], tile_iys=[], years=[],
+        )
+        for spec in tile_specs:
+            tile_geobox = self._world_tiles[spec.tile_ix, spec.tile_iy]
+            bounds = tile_geobox.boundingbox
+            batch.features.append(_extract_band_data(reprojected, bounds))
+            batch.labels.append(_extract_label_data(mining_mask, bounds, tile_geobox.shape))
+            batch.cluster_ids.append(task.cluster_id)
+            batch.tile_ixs.append(spec.tile_ix)
+            batch.tile_iys.append(spec.tile_iy)
+            batch.years.append(task.year)
+        return batch
+
+
+def _extract_band_data(dataset: xr.Dataset, bounds) -> np.ndarray:
+    """Slice each band from dataset at bounds and stack into (C, H, W)."""
+    arrays = [
+        dataset[band].sel(
+            latitude=slice(bounds.top, bounds.bottom),
+            longitude=slice(bounds.left, bounds.right),
+        ).values
+        for band in BANDS
+    ]
+    result = np.stack(arrays, axis=0).astype(np.float32)
+    return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _extract_label_data(
+    mask: Optional[xr.DataArray],
+    bounds,
+    tile_shape: tuple[int, int],
+) -> np.ndarray:
+    """Slice the mining mask at bounds, returning a (1, H, W) float32 array."""
+    if mask is not None:
+        labels = mask.sel(
+            latitude=slice(bounds.top, bounds.bottom),
+            longitude=slice(bounds.left, bounds.right),
+        ).values.astype(np.float32)
+    else:
+        labels = np.zeros(tile_shape, dtype=np.float32)
+
+    if labels.ndim == 2:
+        labels = labels[np.newaxis, ...]  # (H, W) -> (1, H, W)
+    return np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _empty_tile_batch() -> TileBatch:
+    """Return an empty TileBatch (module-level helper)."""
+    return TileBatch(features=[], labels=[], cluster_ids=[], tile_ixs=[], tile_iys=[], years=[])
+
+
+# ---------------------------------------------------------------------------
+# StoreWorker: orchestration layer
+# ---------------------------------------------------------------------------
+
+class StoreWorker:
+    """Orchestrates the full pipeline: validate -> extract -> write.
+
+    Owns a ZarrStore and a TileExtractor.  Does not interact with databases.
+
+    Usage for a new store::
+
+        worker = StoreWorker(config)
+        worker.initialize_store(capacity=10_000)   # create + resize
+        worker.process_task(task_dict)
+
+    Usage to resume writing to an existing store::
+
+        worker = StoreWorker(config)               # loads existing metadata
+        worker.process_task(task_dict)
+    """
+
+    def __init__(self, config: Optional[Config] = None) -> None:
+        self._config = config or Config()
+        self._store = ZarrStore(
+            zarr_dir=self._config.DATA_DIR / "landsat_zarr",
+            tile_shape=self._config.WORLD_GEOBOX_TILE_SIZE,
+        )
+        self._extractor = TileExtractor(self._config)
+        # in-memory buffer for partial (cross-task) chunks
+        self._residual: TileBatch = _empty_tile_batch()
+
+    @property
+    def store(self) -> ZarrStore:
+        return self._store
+
+    def initialize_store(self, capacity: int) -> None:
+        """Create a Zarr store and allocate `capacity` tiles.
+
+        Raises:
+            FileExistsError, ValueError, RuntimeError -- propagated from ZarrStore.
+        """
+        self._store.create(capacity)
+
+    def process_task(self, task_data: dict) -> bool:
+        """Extract and store a single task.
+
+        Args:
+            task_data: Raw task dictionary (see TaskData.from_dict).
+
+        Returns:
+            True on success, False on any handled failure.
         """
         try:
-            geometry_hash = task_data['geometry_hash']
-            year = task_data['year']
-            country_code = task_data['country_code']
-            cluster_id = task_data.get('cluster_id', 0)
-            filepath = Path(task_data['local_filepath'])
-            
-            if not filepath.exists():
-                logger.warning(
-                    f"Downloaded file not found: {filepath}. "
-                    f"Demoting task from DOWNLOADED to COMPLETED to re-download."
-                )
-                self.db.update_task_status(
-                    cluster_id,
-                    year,
-                    self.config.STATUS_COMPLETED
-                )
-                return False
-            
-            # Get tiles for this cluster
-            tiles = self.db.get_tiles_for_cluster(cluster_id)
-            
-            if not tiles:
-                logger.warning(f"No tiles found for {geometry_hash} {year}")
-                return False
-            
-            # Load the image
-            logger.info(f"Processing {len(tiles)} tiles to Zarr format for {country_code} {year}")
-            image = rxr.open_rasterio(filepath)
-            
-            # Get mining footprint from database (uses cluster_id)
-            mining_footprint_json = self.db.get_mining_footprint(cluster_id)
-            mining_geom = shape(mining_footprint_json) if mining_footprint_json else None
-            
-            logger.info(f"Starting reprojection: {len(tiles)} tiles from {filepath.name}")
-            
-            # Reconstruct world geobox
-            world_geobox = GeoBox.from_bbox(
-                [-180, -90, 180, 90],
-                resolution=self.config.WORLD_GEOBOX_RESOLUTION,
-                crs=4326
-            )
-            world_geobox_tiles = GeoboxTiles(
-                world_geobox,
-                tile_shape=self.config.WORLD_GEOBOX_TILE_SIZE
-            )
-            
-            # Compute union geobox of all tiles
-            tile_geoboxes = [world_geobox_tiles[tile['tile_ix'], tile['tile_iy']] for tile in tiles]
-            union_geobox = geobox_union_conservative(tile_geoboxes)
-            
-            logger.info(f"Union geobox: {union_geobox.shape} covering {len(tiles)} tiles")
-            
-            # Reproject image to union geobox once
-            reprojected = image.odc.reproject(union_geobox)
-            logger.debug(f"Reprojected to union geobox")
-            
-            # Round coordinates for alignment
-            reprojected.coords["latitude"] = reprojected.coords["latitude"].values.round(5)
-            reprojected.coords["longitude"] = reprojected.coords["longitude"].values.round(5)
-            
-            # Convert to xarray Dataset with band names
-            conversion_dict = {1: 'blue', 2: 'green', 3: 'red', 4: 'nir', 5: 'swir1', 6: 'swir2', 7: 'thermal'}
-            reprojected = reprojected.to_dataset(dim="band").rename(conversion_dict)
-            
-            # Rasterize mining footprint only for ground truth year (optimization)
-            mining_footprint_union = None
-            if year == self.config.GROUND_TRUTH_YEAR and mining_geom:
-                mining_footprint_union = rasterize(Geometry(mining_geom, crs=4326), union_geobox)
-                logger.info(f"Rasterized mining footprint for ground truth year {year}")
-            
-            # Ensure we have capacity for these tiles
-            self._ensure_capacity(len(tiles))
-            
-            # Get starting index for this batch
-            start_idx = self.store_metadata["next_index"]
-            
-            # Prepare all tiles first (compute all, then write all at once)
-            all_features = []
-            all_labels = []
-            all_cluster_ids = []
-            all_tile_ixs = []
-            all_tile_iys = []
-            all_years = []
-            
-            # Extract all tiles
-            for tile in tiles:
-                tile_ix = tile['tile_ix']
-                tile_iy = tile['tile_iy']
-                
-                # Get tile geobox
-                tile_geobox = world_geobox_tiles[tile_ix, tile_iy]
-                bounds = tile_geobox.boundingbox
-                
-                # Extract band data for this tile from reprojected union
-                band_arrays = [
-                    reprojected[band].sel(
-                        latitude=slice(bounds.top, bounds.bottom),
-                        longitude=slice(bounds.left, bounds.right)
-                    ).values
-                    for band in self.bands
-                ]
-                
-                # Stack bands to (C, H, W)
-                features = np.stack(band_arrays, axis=0).astype(np.float32)
-                
-                # Extract mining footprint for this tile only if this is the ground truth year
-                if year == self.config.GROUND_TRUTH_YEAR and mining_footprint_union is not None:
-                    labels = mining_footprint_union.sel(
-                        latitude=slice(bounds.top, bounds.bottom),
-                        longitude=slice(bounds.left, bounds.right)
-                    ).values.astype(np.float32)
-                else:
-                    # For non-ground truth years, store empty labels
-                    labels = np.zeros(tile_geobox.shape, dtype=np.float32)
-                
-                if labels.ndim == 2:
-                    labels = labels[np.newaxis, ...]  # Add channel dimension (1, H, W)
-                
-                # Replace NaN with 0
-                features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-                labels = np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                all_features.append(features)
-                all_labels.append(labels)
-                all_cluster_ids.append(cluster_id)
-                all_tile_ixs.append(tile_ix)
-                all_tile_iys.append(tile_iy)
-                all_years.append(year)
-            
-            # Write all tiles at once
-            self._write_tiles(
-                start_idx,
-                all_features,
-                all_labels,
-                all_cluster_ids,
-                all_tile_ixs,
-                all_tile_iys,
-                all_years
-            )            
-            # Update next index
-            self.store_metadata["next_index"] = start_idx + len(tiles)
-            self._save_metadata()
-            
-            logger.info(f"✓ Processed and saved {len(tiles)} tiles to Zarr (indices {start_idx} to {start_idx + len(tiles) - 1})")
-            
-            # Close the image file handle
-            image.close()
-            
-            # Keep the downloaded file on disk (don't delete)
-            
-            # Update database - cluster/year is now stored
-            self.db.update_task_status(
-                cluster_id, year, self.config.STATUS_STORED
-            )
-            
-            self.db.increment_worker_counter(self.worker_name, "tasks_processed")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error storing file: {e}", exc_info=True)
-            self.db.increment_worker_counter(self.worker_name, "errors")
+            task = TaskData.from_dict(task_data)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.error("Invalid task data: %s", exc)
             return False
-    
-    def run(self, continuous: bool = True):
-        """Run the storage worker.
-        
-        Args:
-            continuous: If True, run continuously; otherwise run once
-        """
-        logger.info(f"Starting {self.worker_name} worker")
-        
-        while True:
-            self.db.update_worker_heartbeat(self.worker_name, "running")
-            
-            # Get downloaded tasks with country filtering and filenames
-            downloaded_tasks = self.db.get_tasks_by_status(
-                self.config.STATUS_DOWNLOADED,
-                limit=self.config.BATCH_SIZE,
-                countries=self.countries,
-                include_filenames=True
+
+        try:
+            batch = self._extractor.extract(task)
+        except FileNotFoundError as exc:
+            logger.warning("Skipping missing file: %s", exc)
+            return False
+        except ValueError as exc:
+            logger.warning("Skipping invalid task: %s", exc)
+            return False
+        except Exception as exc:
+            logger.error(
+                "Unexpected extraction error for %s year=%d: %s",
+                task.geometry_hash, task.year, exc, exc_info=True,
             )
-            
-            if downloaded_tasks:
-                logger.info(f"Processing {len(downloaded_tasks)} downloaded tasks")
-                for task in downloaded_tasks:
-                    self.store_to_zarr(task)
-            else:
-                logger.debug("No downloaded tasks to store")
-            
-            if not continuous:
-                break
-            
-            time.sleep(self.config.WORKER_SLEEP_INTERVAL)
-        
-        self.db.update_worker_heartbeat(self.worker_name, "stopped")
-        logger.info(f"Stopped {self.worker_name} worker")
+            return False
+
+        # Combine any previously buffered residual with the newly-extracted
+        # tiles from this task so we can write only full chunk multiples.
+        combined = TileBatch.concat(self._residual, batch)
+
+        # Ensure store has capacity for the combined set of tiles (residual + new).
+        if not self._store.check_capacity(len(combined)):
+            return False
+
+        chunk = self._store._chunk_size
+        n_complete = (len(combined) // chunk) * chunk
+
+        if n_complete > 0:
+            to_write, remainder = TileBatch.split(combined, n_complete)
+
+            start_idx = self._store.next_index
+            try:
+                self._store.write_batch(start_idx, to_write)
+            except Exception as exc:
+                logger.error("Failed to write batch to Zarr: %s", exc, exc_info=True)
+                return False
+
+            # Advance metadata only for fully-written tiles
+            self._store.advance_index(n_complete)
+            self._residual = remainder
+
+            logger.info(
+                "Stored %d tile(s) [%d:%d] -- cluster=%d year=%d (residual=%d)",
+                n_complete, start_idx, start_idx + n_complete,
+                task.cluster_id, task.year, len(self._residual),
+            )
+        else:
+            # Nothing to flush to disk yet — keep everything in the residual buffer.
+            self._residual = combined
+            logger.debug("Buffered %d residual tile(s) — deferring write", len(self._residual))
+
+        return True
+
+    def flush_residual(self) -> int:
+        """Write any buffered residual tiles to Zarr. Returns number of tiles written."""
+        n = len(self._residual)
+        if n == 0:
+            logger.debug("No residual tiles to flush")
+            return 0
+
+        # capacity check (preserves existing semantics)
+        if not self._store.check_capacity(n):
+            logger.error("Could not flush residual: insufficient capacity for %d tiles", n)
+            return 0
+
+        start_idx = self._store.next_index
+        try:
+            self._store.write_batch(start_idx, self._residual)
+        except Exception as exc:
+            logger.error("Failed to write residual tiles to Zarr: %s", exc, exc_info=True)
+            return 0
+
+        self._store.advance_index(n)
+        self._residual = _empty_tile_batch()
+        logger.info("Flushed %d residual tile(s) [%d:%d]", n, start_idx, start_idx + n)
+        return n
 
 
-# Deprecated alias for backward compatibility
-ReprojectionWorker = StorageWorker
+# ---------------------------------------------------------------------------
+# Module-level public API
+# ---------------------------------------------------------------------------
+
+def store_task_to_zarr(
+    task_data: dict,
+    config: Optional[Config] = None,
+) -> bool:
+    """Store a single downloaded GeoTIFF into an existing Zarr store.
+
+    The Zarr store must already exist and have capacity initialized.  Use
+    process_downloaded_tasks for bulk processing with automatic store creation.
+
+    Args:
+        task_data: Must contain ``local_filepath``, ``country_code``, ``year``,
+            and ``tiles``.  Optional: ``cluster_id``, ``geometry_hash``,
+            ``footprint``.
+        config: Optional Config instance.
+
+    Returns:
+        True on success, False on failure.
+    """
+    return StoreWorker(config=config).process_task(task_data)
+
+
+def process_downloaded_tasks(
+    config: Optional[Config] = None,
+    countries: Optional[List[str]] = None,
+    input_dir: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> int:
+    """Bulk-process downloaded TIFFs into a new Zarr dataset.
+
+    Scans input_dir for *.tif files with adjacent metadata JSONs produced by
+    the download worker, pre-allocates the Zarr store to the exact required
+    capacity, then processes each file sequentially.
+
+    Args:
+        config: Optional Config instance.
+        countries: Optional ISO-3 country-code whitelist.
+        input_dir: Source directory.  Defaults to Config.DOWNLOAD_DIR.
+        limit: Optional cap on the number of TIFFs to process.
+
+    Returns:
+        Number of successfully stored tasks.
+    """
+    cfg = config or Config()
+    input_path = Path(input_dir) if input_dir else Path(cfg.DOWNLOAD_DIR)
+    if not input_path.exists():
+        logger.error("Input directory not found: %s", input_path)
+        return 0
+
+    tiff_files = sorted(input_path.rglob("*.tif"))
+    if not tiff_files:
+        logger.info("No TIFF files found in %s", input_path)
+        return 0
+
+    if limit:
+        tiff_files = tiff_files[:limit]
+
+    total_tiles = _count_tiles_in_manifests(tiff_files)
+    if total_tiles == 0:
+        logger.warning("No tile metadata found in manifests -- aborting")
+        return 0
+
+    worker = StoreWorker(config=cfg)
+    try:
+        worker.initialize_store(capacity=total_tiles)
+    except (FileExistsError, RuntimeError, ValueError) as exc:
+        logger.error("Could not initialize Zarr store: %s", exc)
+        return 0
+
+    logger.info(
+        "Processing %d TIFF(s) from %s (capacity=%d)",
+        len(tiff_files), input_path, total_tiles,
+    )
+
+    processed = 0
+    for tiff in tiff_files:
+        task_data = _load_task_from_tiff(tiff, countries)
+        if task_data is None:
+            continue
+        if worker.process_task(task_data):
+            processed += 1
+
+    # write any buffered residual tiles (final partial chunk)
+    flushed = worker.flush_residual()
+    if flushed:
+        logger.info("Flushed %d residual tile(s) to Zarr", flushed)
+
+    logger.info("Finished: %d/%d files stored", processed, len(tiff_files))
+    return processed
+
+
+# ---------------------------------------------------------------------------
+# Private module helpers
+# ---------------------------------------------------------------------------
+
+def _count_tiles_in_manifests(tiff_files: Sequence[Path]) -> int:
+    """Sum tile counts from the metadata JSONs adjacent to tiff_files."""
+    total = 0
+    for tiff in tiff_files:
+        meta_path = tiff.with_suffix(".json")
+        if not meta_path.exists():
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                total += len(json.load(f).get("tiles") or [])
+        except Exception:
+            pass
+    return total
+
+
+def _load_task_from_tiff(
+    tiff: Path,
+    countries: Optional[List[str]],
+) -> Optional[dict]:
+    """Read and validate the metadata JSON for tiff.
+
+    Returns a task dict if the file passes filtering, otherwise None.
+    """
+    meta_path = tiff.with_suffix(".json")
+    if not meta_path.exists():
+        logger.warning("Skipping %s: metadata JSON not found", tiff.name)
+        return None
+
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+    except Exception as exc:
+        logger.warning("Skipping %s: could not read metadata: %s", tiff.name, exc)
+        return None
+
+    country = metadata.get("country_code")
+    if countries and country not in countries:
+        logger.debug("Skipping %s: country %r not in filter", tiff.name, country)
+        return None
+
+    return {
+        "local_filepath": str(tiff),
+        "cluster_id":     metadata.get("cluster_id"),
+        "country_code":   country,
+        "year":           metadata.get("year"),
+        "geometry_hash":  metadata.get("geometry_hash"),
+        "tiles":          metadata.get("tiles"),
+        "footprint":      metadata.get("footprint"),
+    }
