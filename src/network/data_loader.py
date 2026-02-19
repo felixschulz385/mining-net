@@ -90,17 +90,20 @@ class MiningSegmentationDataLoader(Dataset):
         
         # Open temporarily to check for index arrays and get metadata
         temp_group = zarr.open_group(store=str(self.zarr_path), mode='r')
-        
-        # Build tile list from index arrays if available, otherwise fallback to metadata
-        if 'cluster_ids' in temp_group and 'tile_ix' in temp_group:
-            logger.info("Using index arrays from Zarr group")
+
+        # The store created by `ZarrStore` exposes per-tile coords named
+        # `tile_ix`, `tile_iy`, `year` and `cluster_id` (singular).  Be
+        # permissive: accept either singular/plural names and filter out
+        # uninitialized slots (filled with -1).
+        if 'tile_ix' in temp_group and 'tile_iy' in temp_group:
+            logger.info("Using index arrays from Zarr group (tile_ix/tile_iy detected)")
             all_tiles = self._tiles_from_index_arrays(temp_group)
         else:
             logger.info("Index arrays not found, loading from metadata.json")
             metadata_path = self.zarr_path.parent / "metadata" / "tiles.json"
             if not metadata_path.exists():
                 raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
-            
+
             with open(metadata_path, 'r') as f:
                 all_tiles = json.load(f)
         
@@ -207,32 +210,53 @@ class MiningSegmentationDataLoader(Dataset):
         return lookup
     
     def _tiles_from_index_arrays(self, zarr_group) -> List[Dict[str, Any]]:
-        """Build tile list from Zarr index arrays.
-        
-        Args:
-            zarr_group: Temporary Zarr group for reading indices
-        
-        Returns:
-            List of tile metadata dicts from index arrays
+        """Build tile list from Zarr index arrays (robust to name changes).
+
+        Supports both the singular names used by `ZarrStore` (`cluster_id`,
+        `year`) and older plural variants (`cluster_ids`, `years`).
+        Filters out uninitialized entries (tile_ix/tile_iy < 0 or year < 0).
         """
         try:
-            cluster_ids = np.array(zarr_group['cluster_ids'][:])
-            tile_ix = np.array(zarr_group['tile_ix'][:])
-            tile_iy = np.array(zarr_group['tile_iy'][:])
-            years = np.array(zarr_group['years'][:])
-            
-            tiles = []
-            for idx in range(len(cluster_ids)):
+            # required coordinates
+            tile_ixs = np.array(zarr_group['tile_ix'][:])
+            tile_iys = np.array(zarr_group['tile_iy'][:])
+
+            # optional / alternate names
+            cluster_arr = None
+            if 'cluster_id' in zarr_group:
+                cluster_arr = np.array(zarr_group['cluster_id'][:])
+            elif 'cluster_ids' in zarr_group:
+                cluster_arr = np.array(zarr_group['cluster_ids'][:])
+
+            year_arr = None
+            if 'year' in zarr_group:
+                year_arr = np.array(zarr_group['year'][:])
+            elif 'years' in zarr_group:
+                year_arr = np.array(zarr_group['years'][:])
+
+            n = len(tile_ixs)
+            tiles: List[Dict[str, Any]] = []
+            for i in range(n):
+                tx = int(tile_ixs[i])
+                ty = int(tile_iys[i])
+                yr = int(year_arr[i]) if year_arr is not None else -1
+                cid = int(cluster_arr[i]) if cluster_arr is not None else -1
+
+                # skip uninitialized slots (Zarr store uses -1 fill for coords)
+                if tx < 0 or ty < 0 or yr < 0:
+                    continue
+
                 tiles.append({
-                    'cluster_id': int(cluster_ids[idx]),
-                    'tile_ix': int(tile_ix[idx]),
-                    'tile_iy': int(tile_iy[idx]),
-                    'year': int(years[idx]),
-                    'country_code': 'UNKNOWN',  # Not tracked in index arrays
-                    'geometry_hash': ''  # Not tracked in index arrays
+                    'cluster_id': cid,
+                    'tile_ix': tx,
+                    'tile_iy': ty,
+                    'year': yr,
+                    'country_code': 'UNKNOWN',
+                    'geometry_hash': '',
+                    'zarr_idx': i,  # slot position in the zarr array
                 })
-            
-            logger.info(f"Built tile list from {len(tiles)} index entries")
+
+            logger.info("Built tile list from index arrays: scanned=%d valid=%d", n, len(tiles))
             return tiles
         except Exception as e:
             logger.warning(f"Could not build tile list from index arrays: {e}")
@@ -257,9 +281,12 @@ class MiningSegmentationDataLoader(Dataset):
                 - features: torch.Tensor of shape (C, H, W)
                 - labels: torch.Tensor of shape (1, H, W)
         """
+        # Resolve the actual zarr slot — the filtered tile list index does not
+        # equal the on-disk position, which is recorded as 'zarr_idx'.
+        zarr_idx = self.tiles[idx].get('zarr_idx', idx)
         # Load from Zarr (efficient, uses chunks)
-        features = torch.from_numpy(np.array(self.features_array[idx])).float()
-        labels = torch.from_numpy(np.array(self.labels_array[idx])).float()
+        features = torch.from_numpy(np.array(self.features_array[zarr_idx])).float()
+        labels = torch.from_numpy(np.array(self.labels_array[zarr_idx])).float()
         
         # Normalize features
         if self.normalize and self.band_means is not None:
@@ -367,8 +394,9 @@ class MiningSegmentationDataLoader(Dataset):
         total_pixels = 0
         
         for idx in indices:
+            zarr_idx = self.tiles[idx].get('zarr_idx', idx)
             # Load from Zarr
-            features = np.array(self.features_array[idx])  # Shape: (C, H, W)
+            features = np.array(self.features_array[zarr_idx])  # Shape: (C, H, W)
             features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Compute stats per channel
@@ -412,8 +440,9 @@ class MiningSegmentationDataLoader(Dataset):
         total_pixels = 0
         
         for idx in tqdm(indices, desc="Computing stats"):
+            zarr_idx = self.tiles[idx].get('zarr_idx', idx)
             # Load from Zarr
-            features = np.array(self.features_array[idx])  # Shape: (C, H, W)
+            features = np.array(self.features_array[zarr_idx])  # Shape: (C, H, W)
             features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Compute stats per channel

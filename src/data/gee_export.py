@@ -64,23 +64,19 @@ class GEEExportWorker:
             country_code = task_data['country_code']
             cluster_id = task_data.get('cluster_id', 0)
             
-            # Parse geometry
-            geometry = json.loads(task_data['geometry_json'])
-            
-            # Get geobox-aligned bounding box
-            geom = Geometry(geometry, crs=4326)
-            tiles = list(self.world_geobox_tiles.tiles(geom))
+            # Get tiles for the cluster from the database (do not recompute from geometry)
+            tiles = self.db.get_tiles_for_cluster(cluster_id)
             
             if not tiles:
-                logger.warning(f"No tiles for {country_code} {year}")
+                logger.warning(f"No tiles recorded in DB for cluster {cluster_id} ({country_code} {year})")
                 return False
             
-            # Use total bounds of all tiles as query region
+            # Build extents for stored tiles and union them to create the ROI
             tile_geoms = [
-                self.world_geobox_tiles[tile_ix, tile_iy].extent.geom
-                for tile_ix, tile_iy in tiles
+                self.world_geobox_tiles[t['tile_ix'], t['tile_iy']].extent.geom
+                for t in tiles
             ]
-            query_geom = gpd.GeoSeries(tile_geoms).unary_union
+            query_geom = gpd.GeoSeries(tile_geoms).union_all()
             roi = ee.Geometry(query_geom.__geo_interface__)
             
             # Get image for the year

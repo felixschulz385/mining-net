@@ -105,7 +105,30 @@ python -m gnt.data.download.mining_segmentation run -v
 python -m gnt.data.download.mining_segmentation status
 ```
 
-### 4. Compress Remaining Files
+### 4. Transfer downloaded TIFFs to HPC
+
+- Use `transfer-downloads` to bundle downloaded TIFFs into tar archives, SCP them to the HPC (`HPC_DATA_PATH/downloads`), extract them remotely, and optionally remove local copies.
+- A legacy alias `transfer-zarr` is preserved and maps to the same Python implementation.
+
+Usage examples:
+```bash
+# Dry-run (no network operations)
+python -m gnt.data.download.mining_segmentation transfer-downloads --dry-run
+
+# Transfer files to HPC (local files are retained)
+python -m gnt.data.download.mining_segmentation transfer-downloads
+
+# Limit files and set batch size (also supports scanning the download dir)
+python -m gnt.data.download.mining_segmentation transfer-downloads --limit 50 --batch-size 25 --scan-dir
+```
+
+Available flags:
+- `--limit N`: transfer up to N files
+- `--batch-size N`: number of files per tar archive (overrides config)
+- `--scan-dir`: scan `DOWNLOAD_DIR` instead of querying the DB
+- `--dry-run`: show what would be transferred without performing network ops
+
+### 5. Compress Remaining Files
 
 ```bash
 # Compress any downloaded files that haven't reached batch size
