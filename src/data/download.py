@@ -9,6 +9,8 @@ import json
 from typing import Optional, List
 from pathlib import Path
 
+import rioxarray as rxr  # used for optional post-download compression
+
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -187,6 +189,9 @@ class DownloadWorker:
             fh.close()
             logger.info(f"✓ Downloaded: {filepath}")
 
+            # run compress helper which may rename / replace the file
+            filepath = self._compress_file(filepath)
+
             # Write metadata JSON alongside the downloaded TIFF
             try:
                 tiles = self.db.get_tiles_for_cluster(cluster_id)
@@ -230,11 +235,46 @@ class DownloadWorker:
 
             self.db.increment_worker_counter(self.worker_name, "tasks_processed")
             return True
-            
         except Exception as e:
             logger.error(f"Error downloading file: {e}", exc_info=True)
             self.db.increment_worker_counter(self.worker_name, "errors")
             return False
+
+    def _compress_file(self, filepath: Path) -> Path:
+        """Optionally compress a TIFF and return the new path.
+
+        If ``Config.COMPRESS_DOWNLOADS`` is False the original filepath is
+        returned unchanged.  When compression is enabled the TIFF is read and
+        rewritten with the codec/level specified in the configuration.  The
+        behavior when ``COMPRESS_KEEP_RAW`` is set controls whether the original
+        image is replaced (default) or a separate ``.compressed.tif`` copy is
+        left alongside it.
+        """
+        if not self.config.COMPRESS_DOWNLOADS:
+            return filepath
+
+        try:
+            with rxr.open_rasterio(filepath, masked=True, decode_coords="all") as ds:
+                arr = ds.squeeze().astype("float32")
+                tmp_path = filepath.with_suffix(".tmp.tif")
+                arr.rio.to_raster(
+                    tmp_path,
+                    compress=self.config.COMPRESS_CODEC,
+                    ZSTD_LEVEL=self.config.COMPRESS_LEVEL,
+                )
+
+            if not self.config.COMPRESS_KEEP_RAW:
+                os.replace(tmp_path, filepath)
+                logger.info(f"  Compressed and replaced original TIFF: {filepath}")
+                return filepath
+            else:
+                new_path = filepath.with_suffix(".compressed.tif")
+                os.replace(tmp_path, new_path)
+                logger.info(f"  Wrote compressed copy: {new_path}")
+                return new_path
+        except Exception as e:
+            logger.warning(f"  Compression failed for {filepath}: {e}")
+            return filepath
     
     def run(self, continuous: bool = True):
         """Run the download worker.

@@ -75,7 +75,7 @@ class Config(BaseConfig):
     
     # Geobox settings (world grid aligned to 30m Landsat)
     WORLD_GEOBOX_RESOLUTION = 0.000269495  # ~30m at equator
-    WORLD_GEOBOX_TILE_SIZE = [64, 64]  # tiles per dimension
+    WORLD_GEOBOX_TILE_SIZE = [256, 256]  # tiles per dimension
     
     # Ground truth year - only this year has labels
     GROUND_TRUTH_YEAR = 2019  # Year with available ground truth labels

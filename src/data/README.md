@@ -19,7 +19,8 @@ Multi-worker system for downloading Landsat annual composites for mining regions
 
 1. **Export Worker**: Submits batch export tasks to Google Earth Engine with geobox-aligned queries
 2. **Status Checker**: Monitors GEE task completion status
-3. **Download Worker**: Downloads completed files, reprojects to grid, saves as zarr, and deletes from Drive
+3. **Download Worker**: Downloads completed files, optionally recompresses the TIFFs,
+   reprojects to grid, saves as zarr, and deletes from Drive
 4. **Reprojection Worker**: Converts downloaded GeoTIFFs to memory-mapped PyTorch format
 5. **Transfer Worker**: Uploads processed data to HPC cluster
 6. **Janitor Worker**: Verifies filesystem integrity and fixes inconsistencies
@@ -60,6 +61,8 @@ earthengine authenticate
 ```
 
 ## Usage
+
+> **Note:** the download worker now supports optional post-download compression of TIFFs. Set `COMPRESS_DOWNLOADS = True` plus codec/level in `local_settings.py` or a subclass of `Config` if you want automatic recompression. The original filename is preserved by default (the compressed file replaces it) unless you set `COMPRESS_KEEP_RAW`.
 
 ### 1. Create Download Tasks
 

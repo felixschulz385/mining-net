@@ -54,6 +54,12 @@ class Config:
     
     # Logging
     LOGS_DIR = BASE_DIR / "logs"
+
+    # Compression
+    COMPRESS_DOWNLOADS: bool = True
+    COMPRESS_CODEC: str = "zstd"
+    COMPRESS_LEVEL: int = 6
+    COMPRESS_KEEP_RAW: bool = False
     
     @classmethod
     def ensure_dirs(cls):
