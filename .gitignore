@@ -133,6 +133,7 @@ logs/
 *.csv
 *.json
 /data
+/data_nobackup
 
 # Secrets
 /secrets

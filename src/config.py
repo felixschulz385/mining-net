@@ -36,7 +36,7 @@ class Config:
     
     # Base paths (device-specific, not committed to git)
     BASE_DIR = _get_base_dir()
-    DATA_DIR = BASE_DIR / "data"
+    DATA_DIR = BASE_DIR / "data_nobackup"
     
     # Database
     DB_PATH = DATA_DIR / "mining_segmentation.db"
